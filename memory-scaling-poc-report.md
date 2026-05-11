@@ -14,7 +14,7 @@ The POC was built on a Databricks free trial workspace in a single session, demo
 
 ## 2. What Was Built
 
-Four notebooks in a Git-backed Databricks workspace (`memory-scaling` repo), each responsible for one layer of the architecture:
+Six notebooks in a Git-backed Databricks workspace (`memory-scaling` repo), each responsible for one layer of the architecture:
 
 | Notebook | Purpose |
 |---|---|
@@ -22,6 +22,8 @@ Four notebooks in a Git-backed Databricks workspace (`memory-scaling` repo), eac
 | `02_bootstrap` | Ingests source documents, chunks into 150-word segments, generates 1024-dim embeddings via Foundation Model API, stores as episodic memories. |
 | `03_retrieval` | Tests semantic retrieval using cosine distance on pgvector embeddings. Validates natural language queries return relevant chunks. |
 | `04_agent` | Wires retrieval into an LLM call (Llama 3.3 70B). Retrieves memories, injects as context, generates grounded answer, writes interaction back as new episodic memory. |
+| `05_distillation` | Converts episodic memories into semantic memories by clustering embeddings and synthesizing one generalization per cluster. Idempotent — only undistilled memories enter each run. |
+| `06_eval` | Memory retention eval. Teaches novel facts via the agent loop, then asks paraphrased recall questions and scores whether the agent surfaces the taught fact. Separates retrieval failures from generation failures. |
 
 ---
 
@@ -50,6 +52,19 @@ The agent follows a three-step loop on each call:
 1. **Retrieve** — embed the question, fetch top 3 most similar memories.
 2. **Generate** — pass retrieved memories as system context to Llama 3.3 70B, generate grounded answer.
 3. **Store** — embed the Q+A pair, write back to Lakebase as a new episodic memory, creating the compounding feedback loop.
+
+### 3.5 Distillation Pipeline
+
+The distillation pipeline converts low-precision episodic memories into higher-precision semantic memories, so that the memory store improves in quality over time rather than only growing in size.
+
+The approach is **cluster + summarize**, not LLM-judge-per-memory:
+
+1. **Fetch** all undistilled episodic memories for the project. Idempotency is enforced via a `NOT EXISTS` clause that excludes any episodic memory already referenced in some semantic row's `derived_from` array.
+2. **Cluster** their embeddings using scikit-learn's `AgglomerativeClustering` with cosine distance and a `distance_threshold` of 0.25 (no fixed `k`). The threshold is the primary tuning knob — too low produces only singletons; too high fuses unrelated topics.
+3. **Synthesize** one semantic statement per cluster of two or more members via a Llama 3.3 70B call. The synthesis prompt explicitly tells the model to drop names, dates, and one-off details, or return `SKIP` if the cluster lacks a coherent idea. Singletons are skipped by design.
+4. **Embed and write back** each synthesis as a new row with `memory_type='semantic'`, the inherited majority domain from cluster members, and a `derived_from UUID[]` array storing the provenance link to the source episodic memories. Schema migration is additive (`ADD COLUMN IF NOT EXISTS`).
+
+The notebook is run manually during the POC stage. Once outputs stabilize, it promotes cleanly to a nightly Databricks Job — the idempotent fetch means re-running costs nothing if there's no new material.
 
 ---
 
@@ -81,6 +96,37 @@ Retrieved memories for a follow-up query (by distance):
 
 The agent produced accurate, specific answers grounded in retrieved context. The answer to *"How does memory scaling reduce reasoning steps?"* correctly cited the 20→5 reasoning steps figure from the source document — a detail that came from retrieved memory, not model training data.
 
+### 4.4 Distillation: Validated
+
+After running `05_distillation` against the bootstrapped episodic memories, semantic memories were verified to outrank episodic ones for general-flavor queries — the intended layered retrieval behavior.
+
+For the query *"How does memory scaling work overall?"*, retrieval returned:
+
+| Rank | Type | Distance | Source |
+|---|---|---|---|
+| 1 | **semantic** | **0.330** | Synthesized: "AI agents can improve performance through memory scaling, where accumulated experience and distilled lessons enhance accuracy and efficiency..." |
+| 2 | episodic | 0.380 | Concept-doc chunk: "Memory-Scaling Knowledge Base on Databricks — A Practitioner's Architecture Guide..." |
+| 3 | episodic | 0.399 | Concept-doc chunk: "deciding during reasoning that a memory query would help..." |
+| 4 | episodic | 0.448 | Concept-doc chunk: "Every component maps to a Databricks primitive already available..." |
+| 5 | **semantic** | **0.450** | Synthesized: "A unified memory system integrates structured queries, full-text search, and vector similarity search..." |
+
+For a broad conceptual question, the synthesized generalization is now the top result, with raw source chunks providing supporting detail underneath. This is the layered behavior the architecture was designed to produce.
+
+### 4.5 Memory Retention Eval
+
+`06_eval` tests the end-to-end memory loop by teaching novel facts through the agent (`ask()`-style write-back) and then asking paraphrased questions whose answers can only come from memory — not from the bootstrapped source documents or LLM training data.
+
+Five invented facts about the POC itself were taught and then probed with paraphrased recall questions. Scoring is keyword presence in the answer (case-insensitive).
+
+| Result | Count | Detail |
+|---|---|---|
+| Full pass (score = 1.0) | 4 / 5 | Right memory retrieved, right terms in answer |
+| Partial (score = 0.5) | 1 / 5 | Right memory retrieved, but answer didn't surface all expected terms |
+| Fail (score = 0) | 0 / 5 | — |
+| **Mean score** | **0.90** | Above the 70% pass target |
+
+Retrieval succeeded on every fact — the correct taught memory appeared in the top 3 for every recall query, often at rank 1. The one partial failure (a numeric question about the production distillation threshold) was a generation problem, not a retrieval problem: the LLM had the right memory in its context but got tangled by multiple numeric values across chunks and pleaded ignorance rather than synthesizing. This separates a fixable generation issue (try a different model, loosen the system prompt, or rephrase the query) from a fundamental architectural one.
+
 ---
 
 ## 5. Infrastructure Used
@@ -100,12 +146,12 @@ The agent produced accurate, specific answers grounded in retrieved context. The
 
 | Missing Component | Description |
 |---|---|
-| Distillation pipeline | Episodic → semantic memory conversion via LLM judge + clustering. |
 | Consolidation job | Deduplication, pruning of unused memories, navigation artifact generation. |
 | Staleness detection | Delta Lake Change Data Feed integration to flag memories linked to changed sources. |
 | Multi-project scoping | Project-scoped access control, cross-project read grants, personal vs. organizational separation. |
 | Unity Catalog governance | Row-level security, memory lineage tracking, GDPR-compliant purge. |
 | Layer 2 systems | Cross-project pattern detection, compliance tracking, schema intelligence. |
+| Auto-refresh of Lakebase OAuth | Tokens currently expire every ~1 hour and must be re-pasted into a `lakebase_config` notebook. Replace with a Databricks SDK call that fetches a fresh token on demand. |
 
 ---
 
@@ -113,11 +159,12 @@ The agent produced accurate, specific answers grounded in retrieved context. The
 
 In priority order:
 
-1. **Distillation pipeline** — nightly Databricks Job that converts episodic → semantic memories. Highest-value addition; makes the memory store improve in precision over time rather than just growing.
-2. **More source diversity** — bootstrap from Delta table schemas, internal wikis, dashboard queries. Real value comes from heterogeneous organizational sources.
-3. **Staleness detection** — wire up Delta Lake Change Data Feed to flag memories when source tables change.
-4. **Corporate workspace access** — move from free trial to corporate Databricks workspace to test with real organizational data and validate governance requirements.
-5. **Unity Catalog governance** — implement project scoping as catalog schemas with row-level security.
+1. **Corporate workspace access** — the free-trial workspace has done its job; the architecture is now proven end-to-end. Moving to a corporate Databricks workspace unlocks real organizational data sources and the governance work below.
+2. **More source diversity** — bootstrap from Delta table schemas, internal wikis, dashboard queries. The current memory store is dominated by one concept document; real value comes from heterogeneous organizational sources.
+3. **Staleness detection** — wire up Delta Lake Change Data Feed to flag memories when source tables change. Foundation already exists in the `source_registry` table.
+4. **Unity Catalog governance** — implement project scoping as catalog schemas with row-level security.
+5. **Promote distillation to a scheduled Job** — once the synthesis prompt and clustering threshold are stable, wrap `05_distillation` in a nightly Databricks Job. The notebook is already idempotent.
+6. **Harden generation** — the eval surfaced one case where retrieval succeeded but the LLM didn't synthesize across multiple retrieved chunks. Worth testing with a stronger model on the same endpoint, or loosening the "context-only" system prompt.
 
 ---
 
