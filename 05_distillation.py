@@ -13,6 +13,10 @@
 # MAGIC Idempotent: the fetch SQL excludes any episodic memory already referenced
 # MAGIC in some semantic row's `derived_from` array, so re-running only processes
 # MAGIC episodic memories created since the last distillation pass.
+# MAGIC
+# MAGIC Schema reference (from `01_schema_setup`): `memories.id` is `UUID` with
+# MAGIC `DEFAULT gen_random_uuid()`; this notebook adds `derived_from UUID[]` on
+# MAGIC first run.
 
 # COMMAND ----------
 
@@ -24,15 +28,21 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
+# MAGIC %run /Users/calvin.waldheim@gmail.com/lakebase_config
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Config — all tuning knobs live here
+# MAGIC
+# MAGIC `CONN_STRING` and `TOKEN` come from the `%run` of `lakebase_config` above
+# MAGIC (a notebook outside this Git folder; never committed).
 
 # COMMAND ----------
 
 import hashlib
 import json
 from collections import Counter
-from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -41,22 +51,16 @@ from mlflow.deployments import get_deploy_client
 from psycopg2.extras import RealDictCursor, execute_values
 from sklearn.cluster import AgglomerativeClustering
 
-# --- Lakebase connection ---------------------------------------------------
-# Same pattern as 02_bootstrap: single connection string + auth token.
-# Wire CONN_STRING and TOKEN here exactly as 02_bootstrap does.
-CONN_STRING = ...   # e.g. "postgresql://user@host/db?sslmode=require"
-TOKEN = ...         # Lakebase OAuth token / DB password
-
 # --- Project scope ---------------------------------------------------------
-# Memories are scoped by project_id. Distillation runs per project so a
-# semantic memory only ever generalizes from one project's episodic rows.
+# Distillation runs per project; semantic memories only generalize across one
+# project's episodic rows.
 PROJECT_ID = "memory-kb-poc"
-PROJECT_TYPE = "product"            # mirrors what 02_bootstrap writes
-SEMANTIC_SCOPE = "organizational"   # semantic memories are by definition cross-cutting
+PROJECT_TYPE = "product"            # mirrors what 02_bootstrap and 04_agent write
+SEMANTIC_SCOPE = "organizational"   # semantic memories are cross-cutting by definition
 SEMANTIC_SOURCE_REF = "distilled-v1"
 SEMANTIC_QUALITY_SCORE = 0.85       # slightly higher than episodic (LLM-vetted generalization)
 
-# --- Foundation Model endpoints -------------------------------------------
+# --- Foundation Model endpoints --------------------------------------------
 EMBED_ENDPOINT = "databricks-gte-large-en"
 LLM_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
 
@@ -71,11 +75,31 @@ client = get_deploy_client("databricks")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 0. One-time additive migration: add `derived_from UUID[]`
+# MAGIC
+# MAGIC `ADD COLUMN IF NOT EXISTS` — safe to run on every invocation.
+
+# COMMAND ----------
+
+MIGRATE_SQL = """
+ALTER TABLE memories
+  ADD COLUMN IF NOT EXISTS derived_from UUID[] DEFAULT NULL;
+"""
+
+with psycopg2.connect(CONN_STRING, password=TOKEN) as conn, conn.cursor() as cur:
+    cur.execute(MIGRATE_SQL)
+    conn.commit()
+print("derived_from column ready.")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 1. Fetch undistilled episodic memories
 # MAGIC
-# MAGIC Pulls `id`, `context` (the full chunk text), `domain` (inherited to the
+# MAGIC Pulls `id`, `context` (full chunk text), `domain` (inherited to the
 # MAGIC semantic memory later), and the embedding as text. The `NOT EXISTS`
-# MAGIC clause is what makes this notebook idempotent.
+# MAGIC clause excludes anything already referenced by a semantic row's
+# MAGIC `derived_from` array — that's what makes re-runs cheap.
 
 # COMMAND ----------
 
@@ -108,6 +132,9 @@ df = pd.DataFrame(rows)
 df["embedding"] = df["embedding_text"].apply(
     lambda s: np.array(json.loads(s), dtype=np.float32)
 )
+# psycopg2 returns UUIDs as uuid.UUID instances; stringify so we can round-trip
+# them through execute_values without surprises.
+df["id"] = df["id"].astype(str)
 
 print(f"Pulled {len(df)} undistilled episodic memories for project '{PROJECT_ID}'")
 df[["id", "domain", "context"]].head()
@@ -166,7 +193,7 @@ def show_cluster(cluster_id: int, max_chars: int = 200) -> None:
     for _, row in members.iterrows():
         snippet = row["context"][:max_chars].replace("\n", " ")
         suffix = "…" if len(row["context"]) > max_chars else ""
-        print(f"  [{row['id']}] ({row['domain']}) {snippet}{suffix}")
+        print(f"  [{row['id'][:8]}…] ({row['domain']}) {snippet}{suffix}")
 
 show_cluster(sizes.index[0])
 
@@ -179,8 +206,20 @@ show_cluster(sizes.index[0])
 # MAGIC clustering threshold). The "drop names, dates, one-off details" rule is
 # MAGIC what pushes the model from "summary of these chunks" toward
 # MAGIC "generalizable statement."
+# MAGIC
+# MAGIC `embed()` mirrors the function in `03_retrieval` / `04_agent` exactly —
+# MAGIC same endpoint, same list-wrapped input shape, same response unwrap.
 
 # COMMAND ----------
+
+def embed(text: str) -> list[float]:
+    """Mirror of the embed() helper in 03_retrieval / 04_agent."""
+    response = client.predict(
+        endpoint=EMBED_ENDPOINT,
+        inputs={"input": [text]},
+    )
+    return response["data"][0]["embedding"]
+
 
 SYNTHESIS_PROMPT = """You are distilling raw episodic memories (interaction logs and source-document chunks) into a single semantic memory — a generalizable statement that captures the shared idea across these examples.
 
@@ -238,7 +277,7 @@ for cluster_id, size in sizes.items():
         "cluster_id": int(cluster_id),
         "context": synthesis,
         "domain": majority_domain(members),
-        "derived_from": members["id"].tolist(),
+        "derived_from": members["id"].tolist(),  # list[str] of UUIDs
     })
     print(f"Cluster {cluster_id} ({size} members, domain={semantic_rows[-1]['domain']}): ✓")
 
@@ -268,30 +307,12 @@ for _, row in semantic_df.iterrows():
 # MAGIC %md
 # MAGIC ## 4. Write semantic memories back to Lakebase
 # MAGIC
-# MAGIC One-time additive migration: add `derived_from BIGINT[]` to `memories`
-# MAGIC if it isn't there yet. Then we embed each synthesis and insert with
-# MAGIC `memory_type='semantic'`, the inherited domain, and the array of source
-# MAGIC episodic IDs.
+# MAGIC Column list mirrors `02_bootstrap` exactly, plus the new `derived_from`
+# MAGIC array. `embedding` goes in as `json.dumps(vec)` (pgvector accepts a
+# MAGIC JSON-formatted array as text input). `ON CONFLICT DO NOTHING` mirrors
+# MAGIC the bootstrap pattern.
 
 # COMMAND ----------
-
-MIGRATE_SQL = """
-ALTER TABLE memories
-  ADD COLUMN IF NOT EXISTS derived_from BIGINT[] DEFAULT NULL;
-"""
-
-with psycopg2.connect(CONN_STRING, password=TOKEN) as conn, conn.cursor() as cur:
-    cur.execute(MIGRATE_SQL)
-    conn.commit()
-print("derived_from column ready.")
-
-# COMMAND ----------
-
-def embed(text: str) -> list[float]:
-    """Mirror 02_bootstrap's embedding call. Adjust the unwrap if its shape differs."""
-    resp = client.predict(endpoint=EMBED_ENDPOINT, inputs={"input": text})
-    return resp["data"][0]["embedding"]
-
 
 INSERT_SQL = """
 INSERT INTO memories
@@ -313,13 +334,13 @@ for _, row in semantic_df.iterrows():
         "semantic",
         SEMANTIC_SCOPE,
         row["domain"],
-        row["context"][:100],       # first 100 chars as the "rule" summary, mirroring 02_bootstrap
+        row["context"][:100],       # first 100 chars as the "rule" summary
         row["context"],
         SEMANTIC_SOURCE_REF,
         content_hash,
         json.dumps(vec),            # pgvector accepts a JSON-formatted array as text input
         SEMANTIC_QUALITY_SCORE,
-        row["derived_from"],
+        row["derived_from"],        # list[str] of UUIDs → UUID[] via implicit cast
     ))
 
 if values:
@@ -336,16 +357,15 @@ else:
 # MAGIC %md
 # MAGIC ## 5. Validate — does retrieval surface semantic memories for general queries?
 # MAGIC
-# MAGIC The expectation: for a broad question, the highest-ranked result should
-# MAGIC now be a `semantic` row, with `episodic` chunks providing supporting
-# MAGIC specifics underneath.
+# MAGIC Mirrors the retrieval pattern from `03_retrieval`. Expectation: a broad
+# MAGIC question should now surface a `semantic` row at or near the top, with
+# MAGIC `episodic` chunks providing supporting specifics underneath.
 
 # COMMAND ----------
 
 QUERY = "How does memory scaling work overall?"
 
 q_vec = embed(QUERY)
-q_str = json.dumps(q_vec)
 
 VALIDATE_SQL = """
 SELECT id,
@@ -361,12 +381,12 @@ LIMIT 5;
 
 with psycopg2.connect(CONN_STRING, password=TOKEN) as conn, \
      conn.cursor(cursor_factory=RealDictCursor) as cur:
-    cur.execute(VALIDATE_SQL, (q_str, PROJECT_ID))
+    cur.execute(VALIDATE_SQL, (json.dumps(q_vec), PROJECT_ID))
     results = cur.fetchall()
 
 print(f"Query: {QUERY}\n")
 for r in results:
-    print(f"[{r['memory_type']:8s}] d={r['distance']:.3f}  id={r['id']}  domain={r['domain']}")
+    print(f"[{r['memory_type']:8s}] d={r['distance']:.3f}  domain={r['domain']}  id={str(r['id'])[:8]}…")
     print(f"           {r['context'][:160]}...")
     print()
 
@@ -396,4 +416,3 @@ for r in results:
 # MAGIC The `NOT EXISTS` filter in section 1 is what keeps the Job idempotent —
 # MAGIC only episodic memories created since the last run are eligible, so
 # MAGIC re-running costs nothing if there's no new material.
-
