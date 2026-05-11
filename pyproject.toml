@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memory-agent"
+version = "0.1.0"
+description = "Refactored memory-scaling package"
+requires-python = ">=3.12"
+dependencies = [
+  "databricks-sdk==0.67.0",
+  "mlflow==3.8.1",
+  "psycopg2-binary==2.9.11",
+  "pytest==8.3.5",
+]
+
+[tool.setuptools]
+packages = ["memory_agent"]
+
+[tool.pytest.ini_options]
+addopts = ["--assert=plain"]
+cache_dir = "/tmp/memory-scaling-pytest-cache"
+pythonpath = ["."]
