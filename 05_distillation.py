@@ -20,7 +20,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install psycopg2-binary scikit-learn --quiet
+# MAGIC %pip install psycopg2-binary scikit-learn mlflow --quiet
 
 # COMMAND ----------
 
@@ -345,7 +345,12 @@ for _, row in semantic_df.iterrows():
 
 if values:
     with psycopg2.connect(CONN_STRING, password=TOKEN) as conn, conn.cursor() as cur:
-        execute_values(cur, INSERT_SQL, values)
+        execute_values(
+            cur,
+            INSERT_SQL,
+            values,
+            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::uuid[])",
+        )
         new_ids = [r[0] for r in cur.fetchall()]
         conn.commit()
     print(f"Wrote {len(new_ids)} semantic memories. IDs: {new_ids}")
