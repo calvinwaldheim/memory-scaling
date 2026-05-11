@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 import psycopg2
+import requests
+from databricks.sdk import WorkspaceClient
 from psycopg2.extensions import connection as PGConnection
 
 from .config import (
     DEFAULT_BOOTSTRAP_SOURCE_REF,
     DEFAULT_PROJECT_ID,
     DEFAULT_TOP_K,
+    get_lakebase_project_name,
     get_lakebase_uri,
 )
 
@@ -26,11 +31,42 @@ ON CONFLICT DO NOTHING
 
 RETRIEVE_MEMORIES_SQL = """
 SELECT rule, context, quality_score,
-       embedding <=> %s::vector AS distance
+       embedding <=> %s::vector AS distance,
+       source_ref, memory_type, domain
 FROM memories
 WHERE project_id = %s
 ORDER BY distance ASC
 LIMIT %s
+"""
+
+STATS_SQL = """
+WITH scoped AS (
+    SELECT memory_type, domain, created_at
+    FROM memories
+    WHERE project_id = %s
+),
+by_type AS (
+    SELECT COALESCE(jsonb_object_agg(memory_type, count_value), '{}'::jsonb) AS value
+    FROM (
+        SELECT memory_type, COUNT(*) AS count_value
+        FROM scoped
+        GROUP BY memory_type
+    ) grouped
+),
+by_domain AS (
+    SELECT COALESCE(jsonb_object_agg(domain_key, count_value), '{}'::jsonb) AS value
+    FROM (
+        SELECT COALESCE(domain, 'unknown') AS domain_key, COUNT(*) AS count_value
+        FROM scoped
+        GROUP BY COALESCE(domain, 'unknown')
+    ) grouped
+)
+SELECT
+    COUNT(*) AS total,
+    (SELECT value FROM by_type) AS by_memory_type,
+    (SELECT value FROM by_domain) AS by_domain,
+    MAX(created_at) AS last_written_at
+FROM scoped
 """
 
 
@@ -38,15 +74,57 @@ LIMIT %s
 class RetrievedMemory:
     """A retrieved memory row returned by pgvector similarity search."""
 
-    rule: str
+    rule: str | None
     context: str
     quality_score: float | None
     distance: float
+    source_ref: str | None = None
+    memory_type: str | None = None
+    domain: str | None = None
+
+
+@dataclass(frozen=True)
+class InsertMemoryResult:
+    """Insert result describing dedupe outcome for a memory write."""
+
+    status: str
+    content_hash: str
+
+
+@dataclass(frozen=True)
+class MemoryStats:
+    """Aggregated statistics for a project's stored memories."""
+
+    total: int
+    by_memory_type: dict[str, int]
+    by_domain: dict[str, int]
+    last_written_at: str | None
+
+
+def _lakebase_endpoint(project_name: str) -> str:
+    """Return the default autoscaling endpoint resource path for a Lakebase project."""
+    return f"projects/{project_name}/branches/production/endpoints/primary"
 
 
 def _get_connection() -> PGConnection:
-    """Create a psycopg2 connection to Lakebase using the configured secret URI."""
-    return psycopg2.connect(get_lakebase_uri())
+    """Create a psycopg2 connection to Lakebase using a runtime postgres credential."""
+    workspace = WorkspaceClient()
+    credential = requests.post(
+        f"{workspace.config.host.rstrip('/')}/api/2.0/postgres/credentials",
+        headers={
+            **workspace.config.authenticate(),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json={
+            "endpoint": _lakebase_endpoint(get_lakebase_project_name()),
+            "request_id": str(uuid.uuid4()),
+        },
+        timeout=30,
+    )
+    credential.raise_for_status()
+    token = credential.json()["token"]
+    return psycopg2.connect(get_lakebase_uri(), password=token)
 
 
 def insert_memory(
@@ -54,13 +132,13 @@ def insert_memory(
     project_type: str,
     memory_type: str,
     scope: str,
-    domain: str,
-    rule: str,
+    domain: str | None,
+    rule: str | None,
     context: str,
     source_ref: str,
     embedding: Sequence[float],
     quality_score: float,
-) -> None:
+) -> InsertMemoryResult:
     """Insert one memory row using the hardened schema defaults.
 
     Args:
@@ -76,7 +154,7 @@ def insert_memory(
         quality_score: Quality score stored with the memory.
 
     Returns:
-        None.
+        Insert metadata including duplicate detection status and content hash.
 
     Raises:
         psycopg2.Error: If the database connection or insert fails.
@@ -102,6 +180,8 @@ def insert_memory(
             ),
         )
         conn.commit()
+        status = "stored" if cur.rowcount == 1 else "duplicate"
+        return InsertMemoryResult(status=status, content_hash=content_hash)
     finally:
         cur.close()
         conn.close()
@@ -183,6 +263,26 @@ def retrieve_memories(
             (json.dumps(list(query_embedding)), project_id, top_k),
         )
         return [RetrievedMemory(*row) for row in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def stats(project_id: str = DEFAULT_PROJECT_ID) -> MemoryStats:
+    """Return aggregate storage statistics for the requested project in one round-trip."""
+    conn = _get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(STATS_SQL, (project_id,))
+        total, by_memory_type, by_domain, last_written_at = cur.fetchone()
+        if isinstance(last_written_at, datetime):
+            last_written_at = last_written_at.isoformat()
+        return MemoryStats(
+            total=total or 0,
+            by_memory_type=dict(by_memory_type or {}),
+            by_domain=dict(by_domain or {}),
+            last_written_at=last_written_at,
+        )
     finally:
         cur.close()
         conn.close()

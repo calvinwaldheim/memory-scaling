@@ -1,0 +1,10 @@
+command:
+  - python
+  - app.py
+env:
+  - name: LAKEBASE_URI
+    valueFrom: lakebase_uri
+  - name: LAKEBASE_PROJECT_NAME
+    valueFrom: lakebase_project_name
+  - name: DATABRICKS_APP_PORT
+    value: "8000"

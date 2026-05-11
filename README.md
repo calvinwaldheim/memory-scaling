@@ -16,7 +16,7 @@ Seven notebooks form a closed memory loop on Lakebase (serverless PostgreSQL + p
 | `04_agent.ipynb` | Agent loop: retrieve → generate with Llama 3.3 70B → write the Q+A back as a new episodic memory |
 | `05_distillation.py` | Distills episodic memories into semantic generalizations via `AgglomerativeClustering` (cosine, `distance_threshold=0.25`) + LLM synthesis. Idempotent. |
 | `06_eval.py` | Memory-retention eval: teach novel facts through the agent, probe with paraphrased recall |
-| `07_scope_test.py` | Validates project containment and personal-scope filtering against `project_id` |
+| `07_scope_check.py` | Validates project containment and personal-scope filtering against `project_id` |
 
 ## Key findings
 
@@ -46,7 +46,7 @@ Full architectural rationale, the distillation design, the retrieval numbers, an
 4. Drop source documents into your workspace and run `02_bootstrap` to seed episodic memory.
 5. Run `03_retrieval` and `04_agent` to exercise the read and write paths.
 6. Run `05_distillation` whenever you want to compress accumulated episodic memories into semantic ones. It's idempotent — re-running with no new material is a no-op.
-7. Run `06_eval` to score memory retention end-to-end. Run `07_scope_test` to validate project-scope isolation.
+7. Run `06_eval` to score memory retention end-to-end. Run `07_scope_check` to validate project-scope isolation.
 
 **A note on tokens.** The Lakebase OAuth token expires every ~1 hour and must be refreshed in `lakebase_config`. Replacing this with a Databricks SDK call that fetches a fresh token on demand is on the next-steps list.
 

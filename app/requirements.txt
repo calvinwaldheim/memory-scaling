@@ -1,0 +1,6 @@
+mcp
+psycopg2-binary
+databricks-sdk
+mlflow
+typing_extensions>=4.13
+-e ..

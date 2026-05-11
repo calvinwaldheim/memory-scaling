@@ -12,6 +12,7 @@ dependencies = [
   "mlflow==3.8.1",
   "psycopg2-binary==2.9.11",
   "pytest==8.3.5",
+  "typing_extensions>=4.13",
 ]
 
 [tool.setuptools]
@@ -21,3 +22,4 @@ packages = ["memory_agent"]
 addopts = ["--assert=plain"]
 cache_dir = "/tmp/memory-scaling-pytest-cache"
 pythonpath = ["."]
+testpaths = ["tests"]

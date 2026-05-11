@@ -10,38 +10,13 @@
 
 # DBTITLE 1,Run live verification
 import hashlib
-import uuid
-
-import psycopg2
-import requests
-from databricks.sdk import WorkspaceClient
 
 import memory_agent.storage as storage
 from memory_agent.agent import answer, retrieve
-from memory_agent.config import DEFAULT_PROJECT_ID, get_lakebase_uri
+from memory_agent.config import DEFAULT_PROJECT_ID
 
 question = "What did we discuss about end to end implementation?"
 endpoint = "projects/memory-kb-poc/branches/production/endpoints/primary"
-
-
-def _runtime_connection():
-    workspace = WorkspaceClient()
-    credential = requests.post(
-        f"{workspace.config.host.rstrip('/')}/api/2.0/postgres/credentials",
-        headers={
-            **workspace.config.authenticate(),
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        json={"endpoint": endpoint, "request_id": str(uuid.uuid4())},
-        timeout=30,
-    )
-    credential.raise_for_status()
-    token = credential.json()["token"]
-    return psycopg2.connect(get_lakebase_uri(), password=token)
-
-
-storage._get_connection = _runtime_connection
 
 cleanup_sql = """
 WITH ranked AS (
@@ -73,7 +48,7 @@ WHERE project_id = %s
 ORDER BY created_at ASC, id ASC
 """
 
-with _runtime_connection() as conn:
+with storage._get_connection() as conn:
     with conn.cursor() as cur:
         cur.execute(cleanup_sql, (DEFAULT_PROJECT_ID, question))
         deleted_rows = cur.fetchall()

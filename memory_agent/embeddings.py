@@ -46,3 +46,8 @@ def embed_texts(texts: Sequence[str]) -> list[list[float]]:
         Exception: Propagates client errors from individual embedding requests.
     """
     return [embed_text(text) for text in texts]
+
+
+def embed(text: str) -> list[float]:
+    """Compatibility alias for app-facing callers that expect embeddings.embed()."""
+    return embed_text(text)
