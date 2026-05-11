@@ -1,0 +1,406 @@
+# Memory-Scaling Knowledge Base on Databricks
+
+## A Practitioner’s Architecture Guide
+
+-----
+
+## The Core Idea
+
+AI agents are stateless by default. Every session starts cold. But agent performance is not fixed — it can scale with accumulated experience, in the same way model performance scales with parameters. This property is **memory scaling**: accuracy improves and reasoning becomes more efficient as the agent accumulates past interactions, distilled lessons, and organizational context.
+
+Databricks research demonstrates this concretely: in experiments on Genie Spaces, agents with accumulated memory achieved both higher accuracy (+5% over expert-curated baselines) and required fewer reasoning steps (from ~20 to ~5), because they retrieve directly rather than exploring from scratch. Uncurated user interaction logs, filtered only by an automated quality judge, outperformed hand-engineered domain instructions after just 62 records.
+
+The bottleneck is not storage — it is governance, quality, and retrieval precision. This document describes an architecture that addresses all three, built entirely on Databricks-native primitives.
+
+-----
+
+## Memory Types
+
+Two distinctions matter for design:
+
+**Episodic vs. Semantic**
+
+|Type    |What it is                                                                             |Storage implication                               |
+|--------|---------------------------------------------------------------------------------------|--------------------------------------------------|
+|Episodic|Raw records: conversation logs, tool-call trajectories, user feedback                  |Direct retrieval; expires or compresses over time |
+|Semantic|Distilled patterns: rules, preferences, domain conventions extracted from episodic data|Generalized; retrieved by similarity; longer-lived|
+
+Episodic memories are the raw material. Semantic memories are what survives distillation — the compressed signal the agent actually uses at inference time. Both are necessary; neither is sufficient alone.
+
+**Personal vs. Organizational**
+
+|Scope         |What it covers                                                             |Access model                              |
+|--------------|---------------------------------------------------------------------------|------------------------------------------|
+|Personal      |Individual user preferences, workflows, interaction history                |Private to the user                       |
+|Organizational|Shared domain knowledge, naming conventions, business rules, schema context|Shared within access-controlled boundaries|
+
+The central governance challenge: organizational memories must be broadly useful without leaking private patterns through abstraction. A semantic memory that looks generic may still reveal confidential intent. Access controls must survive distillation, not just ingestion.
+
+-----
+
+## Architecture: The Project as Atomic Unit
+
+Rather than maintaining one organizational memory store, knowledge lives in **project-scoped units**. A project is a flexible grouping — a team, a product surface, a customer account, a compliance domain, a working group. The boundary is whatever makes the context coherent.
+
+This solves the 500-contributor governance problem: drift, contradictions, and authorship ambiguity are all contained within project boundaries. Each project has a defined write surface and explicit rules for how knowledge crosses into adjacent projects.
+
+### Project Types
+
+Every project has a type that determines its default memory schema, distillation rules, and what a Layer 2 system can aggregate from it:
+
+|Type         |Primary memory content                                                   |
+|-------------|-------------------------------------------------------------------------|
+|`data_domain`|Table schemas, column semantics, common query patterns, business glossary|
+|`engineering`|Architectural decisions, bug lessons, API contracts, code patterns       |
+|`compliance` |Regulatory decisions, audit trails, policy interpretations               |
+|`customer`   |Account context, integration specifics, known issues, preferences        |
+|`product`    |Feature decisions, UX patterns, roadmap rationale                        |
+
+Project type governs artifact schema expectations and compaction behavior. A `data_domain` project distills toward semantic memories about schema and vocabulary; an `engineering` project distills toward lessons and decision records.
+
+### Access Model
+
+```
+Project KB (write: members, read: granted projects)
+    ├── Personal memories (private to user, scoped within project)
+    └── Organizational memories (shared within project, optionally granted outward)
+```
+
+Cross-project sharing is explicit, not automatic: Project A grants read-only access to Project B. This enables reuse without write pollution. Source attribution travels with retrieved content so the agent always knows whether it is drawing on its own project or a granted external context.
+
+-----
+
+## Two-Tier Hierarchy
+
+### Layer 1 — Operational Projects
+
+Operational projects do the work: agents write episodic memories from interactions, the distillation pipeline produces semantic memories, and the retrieval agent surfaces relevant context at inference time. This is where organizational and personal memories live, scoped by project membership.
+
+### Layer 2 — Aggregate Systems
+
+Layer 2 systems have read access to multiple Layer 1 projects and serve a specific analytical job. They do not own content — they surface cross-project patterns and write insights back to Layer 1 as proposals, not impositions.
+
+Examples of parallel Layer 2 systems:
+
+- **Engineering insights**: detects when multiple teams independently solve the same problem, proposes shared semantic memories
+- **Compliance tracker**: aggregates all compliance-relevant decisions across projects into an audit view
+- **Schema intelligence**: surfaces cross-domain vocabulary conflicts and naming convention drift
+
+Two tiers is sufficient. Multiple parallel Layer 2 systems handle the multiple-jobs problem without requiring a third aggregation tier, which would recreate the org-wide governance collapse.
+
+Layer 2 systems can write back to Layer 1 — but as proposals flagged for human review, not as direct commits.
+
+-----
+
+## Storage: Lakebase + Delta Lake
+
+The storage layer combines two complementary Databricks primitives:
+
+**Lakebase (serverless PostgreSQL on Neon)** serves as the primary memory store. It provides unified structured queries, full-text search, and vector similarity search in a single engine — eliminating the need for a separate vector database. Scale-to-0 cost makes it appropriate for per-project instances. Built-in database branching lets engineers fork memory state for testing without affecting production.
+
+**Delta Lake** serves as the source-of-truth layer for enterprise assets — table schemas, documentation, query histories — and as the change signal for dynamic memory linking (described below).
+
+### Schema
+
+```sql
+-- Core memory store (Lakebase / PostgreSQL)
+
+CREATE TABLE memories (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id      TEXT NOT NULL,
+  project_type    TEXT NOT NULL,
+  memory_type     TEXT NOT NULL CHECK (memory_type IN ('episodic', 'semantic')),
+  scope           TEXT NOT NULL CHECK (scope IN ('personal', 'organizational')),
+  user_id         TEXT,                    -- NULL for organizational memories
+  domain          TEXT,                    -- sub-domain within project
+  rule            TEXT NOT NULL,           -- one-line actionable statement
+  context         TEXT NOT NULL,           -- evidence and provenance
+  source_ref      TEXT,                    -- pointer to originating asset
+  source_version  BIGINT,                  -- Delta table version or commit hash at index time
+  content_hash    TEXT NOT NULL,
+  embedding       VECTOR(1024),            -- pgvector column
+  quality_score   FLOAT,                   -- LLM judge score at distillation time
+  retrieval_count INT DEFAULT 0,
+  created_at      TIMESTAMPTZ DEFAULT now(),
+  updated_at      TIMESTAMPTZ DEFAULT now(),
+  metadata        JSONB
+);
+
+CREATE INDEX ON memories USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX ON memories (project_id, memory_type, scope);
+CREATE INDEX ON memories USING gin (to_tsvector('english', rule || ' ' || context));
+
+-- Retrieval log (tracks what was actually used)
+CREATE TABLE retrieval_log (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  memory_id     UUID REFERENCES memories(id),
+  project_id    TEXT NOT NULL,
+  user_id       TEXT,
+  query_text    TEXT,
+  score         FLOAT,
+  retrieved_at  TIMESTAMPTZ DEFAULT now()
+);
+
+-- Source registry (for dynamic linking)
+CREATE TABLE source_registry (
+  source_ref      TEXT PRIMARY KEY,
+  project_id      TEXT NOT NULL,
+  source_type     TEXT,                    -- 'delta_table', 'notebook', 'document'
+  last_version    BIGINT,
+  last_checked_at TIMESTAMPTZ
+);
+```
+
+-----
+
+## Dynamic Linking: Solving the Staleness Problem
+
+Staleness is the primary failure mode for memory systems at scale. An agent that learned last quarter’s schema keeps querying tables that have since been renamed or deleted. A semantic memory about a deprecated API pattern becomes actively misleading.
+
+The solution: memories are **reference-typed, not copy-typed**. Each memory stores a pointer to its source plus the version at index time. When the source changes, the memory is flagged for re-indexing.
+
+Delta Lake’s Change Data Feed provides the change signal:
+
+```python
+# Staleness detection job (runs on schedule via Databricks Jobs)
+def check_staleness():
+    registry = spark.table("source_registry")
+    
+    for row in registry.collect():
+        if row.source_type == "delta_table":
+            current_version = (
+                spark.sql(f"DESCRIBE HISTORY {row.source_ref} LIMIT 1")
+                .select("version")
+                .first()[0]
+            )
+            if current_version > row.last_version:
+                # Flag affected memories for re-embedding
+                flag_for_reindex(row.source_ref, current_version)
+                update_registry(row.source_ref, current_version)
+```
+
+Re-indexing is targeted — only memories linked to changed sources are re-embedded. The agent always retrieves current context without manual refresh cycles.
+
+-----
+
+## Retrieval Architecture
+
+### Proactive Retrieval (Addressing Meta-Cognition)
+
+The core retrieval failure mode: *the agent must decide what to query its memory store before it knows what is in there*. If it fails to anticipate that a relevant memory might help, it never issues the right query.
+
+The solution: retrieval is not agent-initiated — it is infrastructure-triggered. At session start, the task description is automatically embedded and used to query the memory store before the agent begins reasoning. Relevant memories are injected into context. The agent does not decide whether to retrieve; retrieval always happens.
+
+This is the difference between memory as a tool the agent can choose to use and memory as persistent context the agent always has.
+
+### Multi-Modal Search Stack
+
+```python
+def retrieve(query: str, project_id: str, user_id: str, 
+             granted_projects: list[str], top_k: int = 8) -> list[dict]:
+    
+    query_embedding = embed(query)
+    search_scope = [project_id] + granted_projects
+    
+    # 1. Semantic search (primary)
+    semantic_results = db.execute("""
+        SELECT *, embedding <=> %s AS distance,
+               CASE WHEN project_id = %s THEN 1.0 ELSE 0.8 END AS source_weight
+        FROM memories
+        WHERE project_id = ANY(%s)
+          AND (scope = 'organizational' OR user_id = %s)
+          AND quality_score > 0.6
+        ORDER BY (embedding <=> %s) * source_weight
+        LIMIT %s
+    """, [query_embedding, project_id, search_scope, user_id, query_embedding, top_k])
+    
+    # 2. Full-text search (catches keyword matches semantic may miss)
+    fts_results = db.execute("""
+        SELECT *, ts_rank(to_tsvector('english', rule || ' ' || context),
+                          plainto_tsquery('english', %s)) AS rank
+        FROM memories
+        WHERE project_id = ANY(%s)
+          AND to_tsvector('english', rule || ' ' || context) @@ plainto_tsquery('english', %s)
+          AND quality_score > 0.6
+        ORDER BY rank DESC
+        LIMIT 5
+    """, [query, search_scope, query])
+    
+    # Merge, deduplicate, return with source attribution
+    return merge_results(semantic_results, fts_results)
+```
+
+Results carry source attribution (own project vs. granted project) so the agent weights own-project memories appropriately and humans can audit what context shaped a response.
+
+-----
+
+## Memory Management Pipeline
+
+Three processes keep the memory store healthy over time. All run as Databricks Jobs.
+
+### 1. Bootstrapping (Cold Start)
+
+New projects suffer from cold start — no prior interactions to learn from. Mitigate by ingesting existing enterprise assets:
+
+- Delta table schemas and column descriptions
+- Dashboard queries and their natural-language labels
+- Internal documentation and wikis
+- Business glossary terms and their data mappings
+
+These become organizational episodic memories immediately. An LLM enrichment step generates semantic memories from them before any user interaction occurs.
+
+```python
+# Bootstrap pipeline
+def bootstrap_project(project_id: str, assets: list[str]):
+    for asset in assets:
+        content = extract_asset(asset)           # parse schema / doc / query
+        episodes = chunk_and_embed(content)      # episodic memories
+        semantics = distill(episodes)            # LLM distillation pass
+        quality_scores = judge(semantics)        # LLM quality filter
+        
+        store(episodes, memory_type='episodic', project_id=project_id)
+        store([s for s, q in zip(semantics, quality_scores) if q > 0.7],
+              memory_type='semantic', project_id=project_id)
+```
+
+### 2. Distillation (Episodic → Semantic)
+
+Raw interaction logs are noisy. A distillation pass runs periodically, extracting generalized patterns from episodic memories and storing them as semantic memories:
+
+```python
+# Distillation job (nightly)
+def distill_episodic(project_id: str, since: datetime):
+    recent_episodes = fetch_episodic_since(project_id, since)
+    
+    # LLM judge filters low-quality episodes first
+    quality_filtered = [e for e in recent_episodes if judge_quality(e) > 0.6]
+    
+    # Cluster by semantic similarity
+    clusters = cluster_by_embedding(quality_filtered, threshold=0.85)
+    
+    for cluster in clusters:
+        # Distill cluster into a generalized semantic memory
+        semantic = llm_distill(cluster, prompt=DISTILLATION_PROMPT)
+        
+        # Check for contradiction with existing semantic memories
+        conflicts = find_conflicts(semantic, project_id)
+        if conflicts:
+            flag_for_human_review(semantic, conflicts)
+        else:
+            store(semantic, memory_type='semantic', project_id=project_id)
+```
+
+### 3. Consolidation (Pruning + Compaction)
+
+As memory grows, redundancy and staleness accumulate. The consolidation job runs weekly:
+
+```python
+# Consolidation job
+def consolidate(project_id: str):
+    
+    # 1. Find near-duplicate semantic memories
+    duplicates = db.execute("""
+        SELECT a.id, b.id, a.embedding <=> b.embedding AS similarity
+        FROM memories a JOIN memories b ON a.id < b.id
+        WHERE a.project_id = %s AND b.project_id = %s
+          AND a.memory_type = 'semantic' AND b.memory_type = 'semantic'
+          AND a.embedding <=> b.embedding < 0.08
+    """, [project_id, project_id])
+    merge_duplicates(duplicates)
+    
+    # 2. Prune memories never retrieved past retention window
+    db.execute("""
+        DELETE FROM memories
+        WHERE project_id = %s
+          AND retrieval_count = 0
+          AND created_at < now() - INTERVAL '90 days'
+    """, [project_id])
+    
+    # 3. Write navigation artifacts for large domains
+    for domain in get_large_domains(project_id, threshold=50):
+        nav_artifact = llm_summarize_domain(project_id, domain)
+        store(nav_artifact, domain=domain + '_index', memory_type='semantic')
+```
+
+-----
+
+## Governance: Unity Catalog
+
+Project scoping maps directly onto Unity Catalog:
+
+```sql
+-- Each project is a catalog schema
+CREATE SCHEMA memory_catalog.project_payments;
+CREATE SCHEMA memory_catalog.project_auth;
+
+-- Write access: project members
+GRANT MODIFY ON SCHEMA memory_catalog.project_payments TO group_payments_team;
+
+-- Read grant: auth project can read payments memories
+GRANT SELECT ON SCHEMA memory_catalog.project_payments TO group_auth_team;
+
+-- Layer 2 system: read across multiple Layer 1 projects
+GRANT SELECT ON SCHEMA memory_catalog.project_payments TO sp_engineering_insights;
+GRANT SELECT ON SCHEMA memory_catalog.project_auth TO sp_engineering_insights;
+```
+
+Row-level security keeps personal memories private within shared project stores:
+
+```sql
+ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY personal_scope ON memories
+  USING (scope = 'organizational' OR user_id = current_user);
+```
+
+Memory lineage — which memories influenced a given response — is tracked in the retrieval log, satisfying auditability requirements and enabling GDPR-compliant purge of specific user memories on request.
+
+-----
+
+## The Agent Framework
+
+The architecture separates two distinct agent roles:
+
+**Retrieval Agent** — operates at inference time. Receives task description, triggers the multi-modal retrieval stack (infrastructure-initiated, not agent-initiated), receives injected context, executes task, writes episodic memory record of the interaction.
+
+**Curation Agent** — operates offline on a schedule. Runs bootstrapping for new projects, distillation pipeline for recent episodic memories, consolidation for growing domains, staleness detection for dynamic-linked memories, and conflict flagging for human review. This is Till’s “curation pipeline.”
+
+These are different operational profiles — latency-sensitive vs. batch — and should not be collapsed into one agent.
+
+```
+Inference time:
+  Task → [embed task] → [retrieve: semantic + FTS] → [inject context] → Agent → Response
+                                                                              ↓
+                                                                    Write episodic memory
+
+Offline (scheduled):
+  Episodic batch → [quality judge] → [distill] → [conflict check] → Semantic store
+  Semantic store → [cluster] → [merge duplicates] → [prune stale] → [write nav artifacts]
+  Source registry → [check Delta versions] → [flag stale memories] → [re-embed]
+```
+
+-----
+
+## What This Enables
+
+**Agents that compound.** Each interaction makes the next one more efficient. Reasoning steps drop as memory accumulates — the agent retrieves directly rather than exploring. This compounds across users: a workflow learned from one user is immediately available to another without retraining.
+
+**Staleness-resistant context.** Dynamic linking means memory stays current as underlying data assets evolve. The agent working with renamed tables or updated schemas is not misled by what it knew last quarter.
+
+**Federated knowledge without governance collapse.** Project scoping contains drift and authorship. Read grants enable cross-project reuse. Layer 2 systems surface aggregate insights without merging everyone’s context into one noisy store.
+
+**Buildable on existing infrastructure.** Every component maps to a Databricks primitive already available: Lakebase for the memory store, Delta Lake and Change Data Feed for source tracking, Unity Catalog for governance, Databricks Jobs for the curation pipeline, Databricks Vector Search or pgvector for semantic retrieval. No new infrastructure required.
+
+-----
+
+## Known Limits
+
+**Memory quality degrades without active curation.** A wrong memory, retrieved with confidence, produces recurring wrong answers. The LLM judge at distillation and the conflict-detection step in consolidation are not optional.
+
+**Governance must survive distillation.** Abstracting episodic memories into semantic patterns does not remove sensitivity. Access controls and sensitivity labels must be preserved through the distillation step, not just applied at ingestion.
+
+**Retrieval meta-cognition is still partially open.** Infrastructure-triggered retrieval at session start addresses the obvious failure mode. But mid-session retrieval — deciding during reasoning that a memory query would help — still requires the agent to anticipate relevance. This is an active research problem.
+
+-----
+
+*Architecture synthesized from: Databricks Memory Scaling research (MemAlign, ALHF, Instructed Retriever), Cursor workflow patterns for agent context management, and first-principles design for federated organizational knowledge at scale.*
