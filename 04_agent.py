@@ -16,7 +16,6 @@ from memory_agent.agent import answer, retrieve
 from memory_agent.config import DEFAULT_PROJECT_ID
 
 question = "What did we discuss about end to end implementation?"
-endpoint = "projects/memory-kb-poc/branches/production/endpoints/primary"
 
 cleanup_sql = """
 WITH ranked AS (

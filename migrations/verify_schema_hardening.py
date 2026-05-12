@@ -13,42 +13,21 @@ import hashlib
 import json
 import sys
 import time
-import uuid
 from typing import Callable
 
 import psycopg2
-import requests
-from databricks.sdk import WorkspaceClient
 
 sys.path.append("/Workspace/Users/calvin.waldheim@gmail.com/memory-scaling")
 
 import memory_agent.storage as storage
 from memory_agent.agent import answer, retrieve
-from memory_agent.config import DEFAULT_PROJECT_ID, get_lakebase_uri
+from memory_agent.config import DEFAULT_PROJECT_ID
+from memory_agent.storage import _get_connection
 
-DEFAULT_ENDPOINT = "projects/memory-kb-poc/branches/production/endpoints/primary"
 DEFAULT_QUESTION = "What did we discuss about end to end implementation?"
 DEFAULT_INSERT_CONTEXT = "Q: hardening verification?\nA: duplicate insert should be ignored"
 DEFAULT_INSERT_RULE = "hardening verification"
 DEFAULT_INSERT_SOURCE_REF = "schema-hardening-verification"
-
-
-def runtime_connection(endpoint: str):
-    """Create a psycopg2 connection using a fresh runtime Lakebase token."""
-    workspace = WorkspaceClient()
-    credential = requests.post(
-        f"{workspace.config.host.rstrip('/')}/api/2.0/postgres/credentials",
-        headers={
-            **workspace.config.authenticate(),
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        json={"endpoint": endpoint, "request_id": str(uuid.uuid4())},
-        timeout=30,
-    )
-    credential.raise_for_status()
-    token = credential.json()["token"]
-    return psycopg2.connect(get_lakebase_uri(), password=token)
 
 
 def fetch_schema_state(connect: Callable[[], psycopg2.extensions.connection]) -> dict[str, object]:
@@ -173,12 +152,11 @@ def verify_retrieval_shape(connect: Callable[[], psycopg2.extensions.connection]
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     parser.add_argument("--project-id", default=DEFAULT_PROJECT_ID)
     parser.add_argument("--question", default=DEFAULT_QUESTION)
     args = parser.parse_args()
 
-    connect = lambda: runtime_connection(args.endpoint)
+    connect = _get_connection
 
     output = {
         "schema_state": fetch_schema_state(connect),
