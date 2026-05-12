@@ -3,4 +3,4 @@ psycopg2-binary
 databricks-sdk
 mlflow
 typing_extensions>=4.13
--e ..
+./vendor/memory_agent-0.1.0-py3-none-any.whl

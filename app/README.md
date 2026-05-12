@@ -15,3 +15,5 @@ If your local `mcp` CLI version does not provide `dev`, run the server directly 
 * `python app/app.py`
 
 Deployment is manual via the Databricks Apps UI when you are ready. No deploy commands are included here.
+
+Before deploying, run `bash scripts/build_app_wheel.sh` from the repo root to rebuild `app/vendor/memory_agent-0.1.0-py3-none-any.whl` and refresh the last line of `app/requirements.txt` to point at the vendored wheel. After that, deploy the `app/` folder through the UI as usual.

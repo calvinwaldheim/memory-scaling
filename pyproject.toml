@@ -15,6 +15,12 @@ dependencies = [
   "typing_extensions>=4.13",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "build",
+  "pytest==8.3.5",
+]
+
 [tool.setuptools]
 packages = ["memory_agent"]
 

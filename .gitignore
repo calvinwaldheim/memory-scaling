@@ -3,8 +3,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .coverage
-build/
-dist/
+/build/
+/dist/
+!/app/vendor/
+!/app/vendor/*.whl
 .env
 .venv/
 venv/
