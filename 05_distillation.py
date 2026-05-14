@@ -38,9 +38,15 @@ from databricks.sdk import WorkspaceClient
 
 
 def _decode_token_claims(jwt_token: str) -> dict:
-    payload = jwt_token.split(".")[1]
+    parts = jwt_token.split(".")
+    if len(parts) < 2:
+        return {}
+    payload = parts[1]
     padding = "=" * (-len(payload) % 4)
-    return json.loads(base64.urlsafe_b64decode(payload + padding))
+    try:
+        return json.loads(base64.urlsafe_b64decode(payload + padding))
+    except (ValueError, json.JSONDecodeError):
+        return {}
 
 
 workspace = WorkspaceClient()
