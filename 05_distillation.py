@@ -326,16 +326,15 @@ print(f"\nProduced {len(semantic_df)} semantic memories from {len(df)} episodic 
 
 if semantic_df.empty:
     print(
-        "\nNo semantic memories produced — exiting before write/validate.\n"
+        "\nNo semantic memories produced this run — write/validate cells will no-op.\n"
         f"  Episodic memories pulled:            {len(df)}\n"
         f"  Clusters formed:                     {sizes.shape[0]}\n"
         f"  Distillable clusters (size ≥ {MIN_CLUSTER_SIZE}):      {distillable}\n"
         f"  Singletons (skipped pre-LLM):        {singletons}\n"
         f"  Multi-member clusters SKIP'd by LLM: {llm_skipped}"
     )
-    raise SystemExit("No semantic memories produced this run.")
-
-semantic_df[["cluster_id", "domain", "context"]].head()
+else:
+    semantic_df[["cluster_id", "domain", "context"]].head()
 
 # COMMAND ----------
 
