@@ -28,15 +28,57 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
-# MAGIC %run /Users/calvin.waldheim@gmail.com/lakebase_config
+# DBTITLE 1,Lakebase credentials
+import base64
+import json
+import uuid
+
+import requests
+from databricks.sdk import WorkspaceClient
+
+
+def _decode_token_claims(jwt_token: str) -> dict:
+    payload = jwt_token.split(".")[1]
+    padding = "=" * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload + padding))
+
+
+workspace = WorkspaceClient()
+auth_headers = workspace.config.authenticate()
+runtime_token = auth_headers["Authorization"].split(" ", 1)[1]
+runtime_identity = _decode_token_claims(runtime_token).get("sub")
+
+credential = requests.post(
+    f"{workspace.config.host.rstrip('/')}/api/2.0/postgres/credentials",
+    headers={
+        **auth_headers,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    },
+    json={
+        "endpoint": "projects/memory-kb-poc/branches/production/endpoints/primary",
+        "request_id": str(uuid.uuid4()),
+    },
+    timeout=30,
+)
+credential.raise_for_status()
+credential_json = credential.json()
+username = credential_json.get("username") or runtime_identity
+if not username:
+    raise RuntimeError("Unable to determine Lakebase username from the credential response or runtime identity.")
+
+token = credential_json["token"]
+CONN_STRING = f"postgresql://{username}@ep-calm-unit-d101gxib.database.us-west-2.cloud.databricks.com:5432/production?sslmode=require"
+TOKEN = token
+print(f"Connecting to Lakebase as {username}")
 
 # COMMAND ----------
 
+# DBTITLE 1,Config notes
 # MAGIC %md
 # MAGIC ## Config — all tuning knobs live here
 # MAGIC
-# MAGIC `CONN_STRING` and `TOKEN` come from the `%run` of `lakebase_config` above
-# MAGIC (a notebook outside this Git folder; never committed).
+# MAGIC `CONN_STRING` and `TOKEN` are created in the inline Lakebase credential cell above using a fresh runtime postgres credential.
 
 # COMMAND ----------
 
