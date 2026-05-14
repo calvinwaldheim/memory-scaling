@@ -103,7 +103,7 @@ EMBED_ENDPOINT = "databricks-gte-large-en"
 LLM_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
 
 # --- Distillation knobs ----------------------------------------------------
-DISTANCE_THRESHOLD = 0.25   # cosine distance: lower = tighter clusters, less aggregation
+DISTANCE_THRESHOLD = 0.4    # was 0.25 — observed pairwise distances among related chunks land at 0.33–0.44
 MIN_CLUSTER_SIZE = 2        # singletons are skipped (nothing to generalize from)
 MAX_CHUNKS_PER_PROMPT = 10  # cap on episodic examples sent to the LLM per cluster
 SYNTHESIS_TEMPERATURE = 0.2
