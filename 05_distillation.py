@@ -29,35 +29,26 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 # DBTITLE 1,Lakebase credentials
-import base64
-import json
 import uuid
 
 import requests
 from databricks.sdk import WorkspaceClient
 
-
-def _decode_token_claims(jwt_token: str) -> dict:
-    parts = jwt_token.split(".")
-    if len(parts) < 2:
-        return {}
-    payload = parts[1]
-    padding = "=" * (-len(payload) % 4)
-    try:
-        return json.loads(base64.urlsafe_b64decode(payload + padding))
-    except (ValueError, json.JSONDecodeError):
-        return {}
-
-
 workspace = WorkspaceClient()
-auth_headers = workspace.config.authenticate()
-runtime_token = auth_headers["Authorization"].split(" ", 1)[1]
-runtime_identity = _decode_token_claims(runtime_token).get("sub")
+
+# URI (user@host:port/db?sslmode=require) is sourced from the Databricks secret
+# scope used by the rest of the repo — the canonical path that
+# memory_agent.storage._get_connection() also uses. The runtime credential
+# below supplies only the short-lived password (token).
+CONN_STRING = workspace.dbutils.secrets.get(
+    scope="memory-scaling",
+    key="lakebase_uri",
+)
 
 credential = requests.post(
     f"{workspace.config.host.rstrip('/')}/api/2.0/postgres/credentials",
     headers={
-        **auth_headers,
+        **workspace.config.authenticate(),
         "Content-Type": "application/json",
         "Accept": "application/json",
     },
@@ -68,15 +59,8 @@ credential = requests.post(
     timeout=30,
 )
 credential.raise_for_status()
-credential_json = credential.json()
-username = credential_json.get("username") or runtime_identity
-if not username:
-    raise RuntimeError("Unable to determine Lakebase username from the credential response or runtime identity.")
-
-token = credential_json["token"]
-CONN_STRING = f"postgresql://{username}@ep-calm-unit-d101gxib.database.us-west-2.cloud.databricks.com:5432/production?sslmode=require"
-TOKEN = token
-print(f"Connecting to Lakebase as {username}")
+TOKEN = credential.json()["token"]
+print("Connecting to Lakebase using URI from memory-scaling/lakebase_uri secret")
 
 # COMMAND ----------
 
