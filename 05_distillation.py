@@ -307,12 +307,14 @@ def majority_domain(cluster_members: pd.DataFrame) -> str:
 
 
 semantic_rows = []
+llm_skipped = 0
 for cluster_id, size in sizes.items():
     if size < MIN_CLUSTER_SIZE:
         continue
     members = df[df["cluster"] == cluster_id]
     synthesis = synthesize(members)
     if synthesis is None:
+        llm_skipped += 1
         print(f"Cluster {cluster_id} ({size} members): SKIP")
         continue
     semantic_rows.append({
@@ -325,6 +327,18 @@ for cluster_id, size in sizes.items():
 
 semantic_df = pd.DataFrame(semantic_rows)
 print(f"\nProduced {len(semantic_df)} semantic memories from {len(df)} episodic inputs")
+
+if semantic_df.empty:
+    print(
+        "\nNo semantic memories produced — exiting before write/validate.\n"
+        f"  Episodic memories pulled:            {len(df)}\n"
+        f"  Clusters formed:                     {sizes.shape[0]}\n"
+        f"  Distillable clusters (size ≥ {MIN_CLUSTER_SIZE}):      {distillable}\n"
+        f"  Singletons (skipped pre-LLM):        {singletons}\n"
+        f"  Multi-member clusters SKIP'd by LLM: {llm_skipped}"
+    )
+    raise SystemExit("No semantic memories produced this run.")
+
 semantic_df[["cluster_id", "domain", "context"]].head()
 
 # COMMAND ----------
