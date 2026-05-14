@@ -30,19 +30,25 @@ dbutils.library.restartPython()
 
 # DBTITLE 1,Lakebase credentials
 import uuid
+from urllib.parse import quote, urlparse, urlunparse
 
 import requests
 from databricks.sdk import WorkspaceClient
 
 workspace = WorkspaceClient()
 
-# URI (user@host:port/db?sslmode=require) is sourced from the Databricks secret
-# scope used by the rest of the repo — the canonical path that
-# memory_agent.storage._get_connection() also uses. The runtime credential
-# below supplies only the short-lived password (token).
-CONN_STRING = workspace.dbutils.secrets.get(
-    scope="memory-scaling",
-    key="lakebase_uri",
+# The Lakebase OAuth token issued below is scoped to the Job's runtime identity
+# (the "Run as" principal). The Postgres user in the connection string must
+# match that identity — otherwise Lakebase rejects the connection with
+# "OAuth: User is not authorized". We take host/port/db from the secret-stored
+# URI (same source memory_agent.storage._get_connection uses) and substitute
+# the live runtime user.
+secret_uri = workspace.dbutils.secrets.get(scope="memory-scaling", key="lakebase_uri")
+runtime_user = workspace.current_user.me().user_name
+_parsed = urlparse(secret_uri)
+_host_port = _parsed.hostname + (f":{_parsed.port}" if _parsed.port else "")
+CONN_STRING = urlunparse(
+    _parsed._replace(netloc=f"{quote(runtime_user, safe='')}@{_host_port}")
 )
 
 credential = requests.post(
@@ -60,7 +66,7 @@ credential = requests.post(
 )
 credential.raise_for_status()
 TOKEN = credential.json()["token"]
-print("Connecting to Lakebase using URI from memory-scaling/lakebase_uri secret")
+print(f"Connecting to Lakebase as {runtime_user}")
 
 # COMMAND ----------
 
