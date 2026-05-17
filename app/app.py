@@ -61,12 +61,27 @@ def recall(
     query: str,
     top_k: int = 3,
     project_id: str = "memory-kb-poc",
+    memory_type: str | None = None,
+    domain: str | None = None,
+    min_quality_score: float | None = None,
 ) -> list[dict[str, Any]]:
     """Retrieve the nearest stored memories for a query.
 
     Call this when an agent needs grounded context from the memory store before answering or planning. The return value is a ranked list of memory dictionaries. Each item contains only `content`, `source_ref`, `memory_type`, `domain`, `rule`, `quality_score`, and `distance`; lower `distance` means a closer match.
+
+    Optional filters narrow the candidate set before similarity ranking:
+    - `memory_type`: `"episodic"` for raw experiences/observations, or `"semantic"` for distilled rules/generalizations.
+    - `domain`: exact-match string (e.g. `"architecture"`, `"interactions"`). Inspect `stats` for the available domains.
+    - `min_quality_score`: inclusive lower bound (0.0–1.0). Use `0.7` to drop low-confidence memories.
     """
-    memories = memory_agent.retrieve(question=query, project_id=project_id, top_k=top_k)
+    memories = memory_agent.retrieve(
+        question=query,
+        project_id=project_id,
+        top_k=top_k,
+        memory_type=memory_type,
+        domain=domain,
+        min_quality_score=min_quality_score,
+    )
     return [
         {
             "content": memory.context,

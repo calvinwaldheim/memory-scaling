@@ -31,12 +31,15 @@ ON CONFLICT DO NOTHING
 
 RETRIEVE_MEMORIES_SQL = """
 SELECT rule, context, quality_score,
-       embedding <=> %s::vector AS distance,
+       embedding <=> %(emb)s::vector AS distance,
        source_ref, memory_type, domain
 FROM memories
-WHERE project_id = %s
+WHERE project_id = %(project_id)s
+  AND (%(memory_type)s::text IS NULL OR memory_type = %(memory_type)s)
+  AND (%(domain)s::text IS NULL OR domain = %(domain)s)
+  AND (%(min_quality_score)s::float IS NULL OR quality_score >= %(min_quality_score)s)
 ORDER BY distance ASC
-LIMIT %s
+LIMIT %(top_k)s
 """
 
 STATS_SQL = """
@@ -241,6 +244,9 @@ def retrieve_memories(
     query_embedding: Sequence[float],
     project_id: str = DEFAULT_PROJECT_ID,
     top_k: int = DEFAULT_TOP_K,
+    memory_type: str | None = None,
+    domain: str | None = None,
+    min_quality_score: float | None = None,
 ) -> list[RetrievedMemory]:
     """Retrieve the top-k similar memories using pgvector cosine distance.
 
@@ -248,6 +254,9 @@ def retrieve_memories(
         query_embedding: The embedded user query.
         project_id: Project identifier filter for the memories table.
         top_k: Maximum number of rows to return.
+        memory_type: Optional exact-match filter on ``memory_type`` (``"episodic"`` or ``"semantic"``).
+        domain: Optional exact-match filter on ``domain``.
+        min_quality_score: Optional inclusive lower bound on ``quality_score``.
 
     Returns:
         Retrieved memory rows sorted by ascending cosine distance.
@@ -260,7 +269,14 @@ def retrieve_memories(
     try:
         cur.execute(
             RETRIEVE_MEMORIES_SQL,
-            (json.dumps(list(query_embedding)), project_id, top_k),
+            {
+                "emb": json.dumps(list(query_embedding)),
+                "project_id": project_id,
+                "top_k": top_k,
+                "memory_type": memory_type,
+                "domain": domain,
+                "min_quality_score": min_quality_score,
+            },
         )
         return [RetrievedMemory(*row) for row in cur.fetchall()]
     finally:
