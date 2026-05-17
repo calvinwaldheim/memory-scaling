@@ -134,7 +134,7 @@ def verify_retrieval_shape(connect: Callable[[], psycopg2.extensions.connection]
 
         start = time.perf_counter()
         response = answer(question)
-        retrieved = retrieve(question)
+        retrieved = retrieve(question, track_retrieval=False)
         elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
 
         content = f"Q: {question}\nA: {response}"

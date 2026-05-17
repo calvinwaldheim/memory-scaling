@@ -67,7 +67,9 @@ def recall(
 ) -> list[dict[str, Any]]:
     """Retrieve the nearest stored memories for a query.
 
-    Call this when an agent needs grounded context from the memory store before answering or planning. The return value is a ranked list of memory dictionaries. Each item contains only `content`, `source_ref`, `memory_type`, `domain`, `rule`, `quality_score`, and `distance`; lower `distance` means a closer match.
+    Call this when an agent needs grounded context from the memory store before answering or planning. The return value is a ranked list of memory dictionaries. Each item contains `id`, `content`, `source_ref`, `memory_type`, `domain`, `rule`, `quality_score`, and `distance`; lower `distance` means a closer match.
+
+    Side effect: each returned row's `retrieval_count` is incremented so future consolidation/pruning can prefer hot memories.
 
     Optional filters narrow the candidate set before similarity ranking:
     - `memory_type`: `"episodic"` for raw experiences/observations, or `"semantic"` for distilled rules/generalizations.
@@ -84,6 +86,7 @@ def recall(
     )
     return [
         {
+            "id": memory.id,
             "content": memory.context,
             "source_ref": memory.source_ref,
             "memory_type": memory.memory_type,

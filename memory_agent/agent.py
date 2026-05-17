@@ -5,7 +5,7 @@ from __future__ import annotations
 from .config import AGENT_SOURCE_REF, DEFAULT_PROJECT_ID, DEFAULT_TOP_K
 from .embeddings import embed_text
 from .llm import generate_answer
-from .storage import RetrievedMemory, insert_memory, retrieve_memories
+from .storage import RetrievedMemory, bump_retrieval_counts, insert_memory, retrieve_memories
 
 
 def retrieve(
@@ -15,6 +15,7 @@ def retrieve(
     memory_type: str | None = None,
     domain: str | None = None,
     min_quality_score: float | None = None,
+    track_retrieval: bool = True,
 ) -> list[RetrievedMemory]:
     """Embed a question and retrieve the top-k similar memories.
 
@@ -25,6 +26,9 @@ def retrieve(
         memory_type: Optional exact-match filter on ``memory_type`` (``"episodic"`` or ``"semantic"``).
         domain: Optional exact-match filter on ``domain``.
         min_quality_score: Optional inclusive lower bound on ``quality_score``.
+        track_retrieval: When True (default) bump ``retrieval_count`` on each returned row so
+            consolidation/pruning can later prefer hot memories. Pass False from eval and
+            verification scripts that should not perturb production usage signals.
 
     Returns:
         Retrieved memory rows sorted by ascending cosine distance.
@@ -32,7 +36,7 @@ def retrieve(
     Raises:
         Exception: Propagates embedding or database errors.
     """
-    return retrieve_memories(
+    memories = retrieve_memories(
         query_embedding=embed_text(question),
         project_id=project_id,
         top_k=top_k,
@@ -40,6 +44,9 @@ def retrieve(
         domain=domain,
         min_quality_score=min_quality_score,
     )
+    if track_retrieval and memories:
+        bump_retrieval_counts([m.id for m in memories if m.id])
+    return memories
 
 
 def answer(

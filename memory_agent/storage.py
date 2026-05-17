@@ -32,7 +32,7 @@ ON CONFLICT DO NOTHING
 RETRIEVE_MEMORIES_SQL = """
 SELECT rule, context, quality_score,
        embedding <=> %(emb)s::vector AS distance,
-       source_ref, memory_type, domain
+       source_ref, memory_type, domain, id
 FROM memories
 WHERE project_id = %(project_id)s
   AND (%(memory_type)s::text IS NULL OR memory_type = %(memory_type)s)
@@ -40,6 +40,12 @@ WHERE project_id = %(project_id)s
   AND (%(min_quality_score)s::float IS NULL OR quality_score >= %(min_quality_score)s)
 ORDER BY distance ASC
 LIMIT %(top_k)s
+"""
+
+BUMP_RETRIEVAL_COUNT_SQL = """
+UPDATE memories
+SET retrieval_count = COALESCE(retrieval_count, 0) + 1
+WHERE id = ANY(%(ids)s::uuid[])
 """
 
 STATS_SQL = """
@@ -84,6 +90,7 @@ class RetrievedMemory:
     source_ref: str | None = None
     memory_type: str | None = None
     domain: str | None = None
+    id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -278,10 +285,49 @@ def retrieve_memories(
                 "min_quality_score": min_quality_score,
             },
         )
-        return [RetrievedMemory(*row) for row in cur.fetchall()]
+        rows = cur.fetchall()
     finally:
         cur.close()
         conn.close()
+    return [
+        RetrievedMemory(
+            rule=row[0],
+            context=row[1],
+            quality_score=row[2],
+            distance=row[3],
+            source_ref=row[4],
+            memory_type=row[5],
+            domain=row[6],
+            id=str(row[7]) if row[7] is not None else None,
+        )
+        for row in rows
+    ]
+
+
+def bump_retrieval_counts(memory_ids: Sequence[str]) -> int:
+    """Increment ``retrieval_count`` on the given memory ids.
+
+    Args:
+        memory_ids: UUID strings identifying the memory rows that were just retrieved.
+
+    Returns:
+        The number of rows updated. Callers can ignore this; it's surfaced for tests.
+
+    Raises:
+        psycopg2.Error: If the database connection or update fails.
+    """
+    ids = [str(mid) for mid in memory_ids if mid]
+    if not ids:
+        return 0
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(BUMP_RETRIEVAL_COUNT_SQL, {"ids": ids})
+            updated = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return updated
 
 
 def stats(project_id: str = DEFAULT_PROJECT_ID) -> MemoryStats:
