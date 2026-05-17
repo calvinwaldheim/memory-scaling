@@ -131,6 +131,56 @@ def remember(
 
 
 @mcp.tool()
+def forget(memory_id: str) -> dict[str, Any]:
+    """Delete one memory by id.
+
+    Use this when a memory is wrong, obsolete, or off-scope and should no longer be retrievable. The id comes from a prior `recall` result. The return value is the deleted row's fields (`id`, `rule`, `content`, `memory_type`, `domain`, `scope`, `quality_score`) so the caller can confirm what was removed; if no row matched the id, the response is `{"status": "not_found", "memory_id": "..."}`.
+
+    To correct a memory's content rather than discard it, call `forget` followed by `remember` with the new content — the embedding has to be recomputed for retrieval to find the new wording.
+    """
+    deleted = storage.delete_memory(memory_id)
+    if deleted is None:
+        return {"status": "not_found", "memory_id": memory_id}
+    return {"status": "deleted", **deleted}
+
+
+@mcp.tool()
+def update_memory(
+    memory_id: str,
+    rule: str | None = None,
+    domain: str | None = None,
+    quality_score: float | None = None,
+    memory_type: str | None = None,
+    scope: str | None = None,
+) -> dict[str, Any]:
+    """Update lightweight metadata on one memory by id.
+
+    Use this to relabel a memory without changing its content — e.g. fix the `domain` after observing that "interactions" should be "architecture", lower a `quality_score` after the memory turned out to be unreliable, or promote an `episodic` row to `semantic` after manual review. Only fields explicitly passed (non-None) are changed; the rest are left intact.
+
+    `content` is deliberately not updatable here because changing it would invalidate the stored embedding and content_hash. To rewrite content, call `forget` and then `remember` with the new content.
+
+    Returns the updated row's fields, or `{"status": "not_found", "memory_id": "..."}` if the id didn't match.
+    """
+    fields: dict[str, Any] = {}
+    if rule is not None:
+        fields["rule"] = rule
+    if domain is not None:
+        fields["domain"] = domain
+    if quality_score is not None:
+        fields["quality_score"] = quality_score
+    if memory_type is not None:
+        fields["memory_type"] = memory_type
+    if scope is not None:
+        fields["scope"] = scope
+    if not fields:
+        return {"status": "no_change", "memory_id": memory_id}
+    updated = storage.update_memory_fields(memory_id, **fields)
+    if updated is None:
+        return {"status": "not_found", "memory_id": memory_id}
+    return {"status": "updated", **updated}
+
+
+@mcp.tool()
 def stats(project_id: str = "memory-kb-poc") -> dict[str, Any]:
     """Summarize the current contents of the memory store for one project.
 

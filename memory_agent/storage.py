@@ -48,6 +48,17 @@ SET retrieval_count = COALESCE(retrieval_count, 0) + 1
 WHERE id = ANY(%(ids)s::uuid[])
 """
 
+DELETE_MEMORY_SQL = """
+DELETE FROM memories
+WHERE id = %(id)s::uuid
+RETURNING id, rule, context, memory_type, domain, scope, quality_score
+"""
+
+# Fields that update_memory_fields() is allowed to overwrite. `context` is
+# intentionally excluded because changing it would invalidate the stored
+# embedding and content_hash — model that as forget + remember instead.
+UPDATABLE_FIELDS = ("rule", "domain", "quality_score", "memory_type", "scope")
+
 STATS_SQL = """
 WITH scoped AS (
     SELECT memory_type, domain, created_at
@@ -328,6 +339,100 @@ def bump_retrieval_counts(memory_ids: Sequence[str]) -> int:
     finally:
         conn.close()
     return updated
+
+
+def delete_memory(memory_id: str) -> dict | None:
+    """Hard-delete one memory row by id.
+
+    Args:
+        memory_id: UUID string of the row to remove.
+
+    Returns:
+        A dict describing the deleted row (``id``, ``rule``, ``context``, ``memory_type``,
+        ``domain``, ``scope``, ``quality_score``) or ``None`` if no row matched.
+
+    Raises:
+        psycopg2.Error: If the database connection or delete fails.
+    """
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(DELETE_MEMORY_SQL, {"id": memory_id})
+            row = cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {
+        "id": str(row[0]),
+        "rule": row[1],
+        "context": row[2],
+        "memory_type": row[3],
+        "domain": row[4],
+        "scope": row[5],
+        "quality_score": row[6],
+    }
+
+
+def update_memory_fields(memory_id: str, **fields: object) -> dict | None:
+    """Update one memory row's lightweight fields by id.
+
+    Only the fields listed in ``UPDATABLE_FIELDS`` may be changed; passing any
+    other key raises ``ValueError``. ``context`` is intentionally not updatable
+    because changing it would invalidate the stored embedding and content_hash —
+    callers should ``delete_memory`` + re-insert instead.
+
+    Args:
+        memory_id: UUID string of the row to update.
+        **fields: New values for one or more of ``rule``, ``domain``, ``quality_score``,
+            ``memory_type``, ``scope``. Pass ``None`` as a value to set the column to NULL.
+
+    Returns:
+        A dict describing the updated row (same shape as ``delete_memory``'s return value)
+        or ``None`` if no row matched.
+
+    Raises:
+        ValueError: If no updatable fields were provided or unknown keys were passed.
+        psycopg2.Error: If the database connection or update fails.
+    """
+    rejected = set(fields) - set(UPDATABLE_FIELDS)
+    if rejected:
+        raise ValueError(
+            f"Cannot update {sorted(rejected)}; only {list(UPDATABLE_FIELDS)} are allowed."
+        )
+    if not fields:
+        raise ValueError("update_memory_fields requires at least one field to change.")
+
+    # Column names come from the closed UPDATABLE_FIELDS tuple, not user input,
+    # so direct string composition is safe. Values are still parameterised.
+    set_clause = ", ".join(f"{col} = %({col})s" for col in fields)
+    query = (
+        f"UPDATE memories SET {set_clause}, updated_at = NOW() "
+        "WHERE id = %(id)s::uuid "
+        "RETURNING id, rule, context, memory_type, domain, scope, quality_score"
+    )
+    params = {**fields, "id": memory_id}
+
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            row = cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {
+        "id": str(row[0]),
+        "rule": row[1],
+        "context": row[2],
+        "memory_type": row[3],
+        "domain": row[4],
+        "scope": row[5],
+        "quality_score": row[6],
+    }
 
 
 def stats(project_id: str = DEFAULT_PROJECT_ID) -> MemoryStats:
