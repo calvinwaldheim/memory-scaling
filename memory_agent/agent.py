@@ -10,7 +10,8 @@ from .storage import RetrievedMemory, bump_retrieval_counts, insert_memory, retr
 
 def retrieve(
     question: str,
-    project_id: str = DEFAULT_PROJECT_ID,
+    project_id: str | None = None,
+    project_ids: list[str] | None = None,
     top_k: int = DEFAULT_TOP_K,
     memory_type: str | None = None,
     domain: str | None = None,
@@ -39,6 +40,7 @@ def retrieve(
     memories = retrieve_memories(
         query_embedding=embed_text(question),
         project_id=project_id,
+        project_ids=project_ids,
         top_k=top_k,
         memory_type=memory_type,
         domain=domain,

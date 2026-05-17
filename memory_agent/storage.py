@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -32,9 +33,9 @@ ON CONFLICT DO NOTHING
 RETRIEVE_MEMORIES_SQL = """
 SELECT rule, context, quality_score,
        embedding <=> %(emb)s::vector AS distance,
-       source_ref, memory_type, domain, id
+       source_ref, memory_type, domain, id, project_id
 FROM memories
-WHERE project_id = %(project_id)s
+WHERE project_id = ANY(%(project_ids)s::text[])
   AND (%(memory_type)s::text IS NULL OR memory_type = %(memory_type)s)
   AND (%(domain)s::text IS NULL OR domain = %(domain)s)
   AND (%(min_quality_score)s::float IS NULL OR quality_score >= %(min_quality_score)s)
@@ -58,6 +59,44 @@ RETURNING id, rule, context, memory_type, domain, scope, quality_score
 # intentionally excluded because changing it would invalidate the stored
 # embedding and content_hash — model that as forget + remember instead.
 UPDATABLE_FIELDS = ("rule", "domain", "quality_score", "memory_type", "scope")
+
+PROJECT_TYPES = ("data_domain", "engineering", "compliance", "customer", "product")
+PROJECT_ID_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+CREATE_PROJECT_SQL = """
+INSERT INTO projects (project_id, name, project_type, description, tags, created_by)
+VALUES (%(project_id)s, %(name)s, %(project_type)s, %(description)s, %(tags)s, %(created_by)s)
+RETURNING project_id, name, project_type, description, tags, created_at, created_by, archived_at
+"""
+
+LIST_PROJECTS_SQL = """
+SELECT p.project_id, p.name, p.project_type, p.description, p.tags,
+       p.created_at, p.created_by, p.archived_at,
+       COALESCE(c.memory_count, 0) AS memory_count
+FROM projects p
+LEFT JOIN (
+    SELECT project_id, COUNT(*) AS memory_count
+    FROM memories
+    GROUP BY project_id
+) c ON c.project_id = p.project_id
+WHERE %(include_archived)s OR p.archived_at IS NULL
+ORDER BY p.archived_at NULLS FIRST, p.created_at ASC
+"""
+
+GET_PROJECT_SQL = """
+SELECT p.project_id, p.name, p.project_type, p.description, p.tags,
+       p.created_at, p.created_by, p.archived_at,
+       (SELECT COUNT(*) FROM memories WHERE project_id = p.project_id) AS memory_count
+FROM projects p
+WHERE p.project_id = %(project_id)s
+"""
+
+ARCHIVE_PROJECT_SQL = """
+UPDATE projects
+SET archived_at = NOW()
+WHERE project_id = %(project_id)s AND archived_at IS NULL
+RETURNING project_id, name, project_type, archived_at
+"""
 
 STATS_SQL = """
 WITH scoped AS (
@@ -117,6 +156,7 @@ class RetrievedMemory:
     memory_type: str | None = None
     domain: str | None = None
     id: str | None = None
+    project_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +165,21 @@ class InsertMemoryResult:
 
     status: str
     content_hash: str
+
+
+@dataclass(frozen=True)
+class Project:
+    """Metadata for one project in the registry."""
+
+    project_id: str
+    name: str
+    project_type: str
+    description: str | None
+    tags: list[str]
+    created_at: str | None
+    created_by: str | None
+    archived_at: str | None
+    memory_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -281,7 +336,8 @@ def store_bootstrap_memories(
 
 def retrieve_memories(
     query_embedding: Sequence[float],
-    project_id: str = DEFAULT_PROJECT_ID,
+    project_id: str | None = None,
+    project_ids: Sequence[str] | None = None,
     top_k: int = DEFAULT_TOP_K,
     memory_type: str | None = None,
     domain: str | None = None,
@@ -289,20 +345,32 @@ def retrieve_memories(
 ) -> list[RetrievedMemory]:
     """Retrieve the top-k similar memories using pgvector cosine distance.
 
+    Exactly one of ``project_id`` or ``project_ids`` should be provided. If both are
+    omitted, defaults to ``DEFAULT_PROJECT_ID``; if both are passed, ``project_ids`` wins.
+
     Args:
         query_embedding: The embedded user query.
-        project_id: Project identifier filter for the memories table.
+        project_id: Single project filter (most common case).
+        project_ids: Multiple-project filter for cross-project recall.
         top_k: Maximum number of rows to return.
         memory_type: Optional exact-match filter on ``memory_type`` (``"episodic"`` or ``"semantic"``).
         domain: Optional exact-match filter on ``domain``.
         min_quality_score: Optional inclusive lower bound on ``quality_score``.
 
     Returns:
-        Retrieved memory rows sorted by ascending cosine distance.
+        Retrieved memory rows sorted by ascending cosine distance. Each row carries
+        ``project_id`` so callers can attribute when querying across projects.
 
     Raises:
         psycopg2.Error: If the database connection or query fails.
     """
+    if project_ids:
+        targets = list(project_ids)
+    elif project_id:
+        targets = [project_id]
+    else:
+        targets = [DEFAULT_PROJECT_ID]
+
     conn = _get_connection()
     cur = conn.cursor()
     try:
@@ -310,7 +378,7 @@ def retrieve_memories(
             RETRIEVE_MEMORIES_SQL,
             {
                 "emb": json.dumps(list(query_embedding)),
-                "project_id": project_id,
+                "project_ids": targets,
                 "top_k": top_k,
                 "memory_type": memory_type,
                 "domain": domain,
@@ -331,6 +399,7 @@ def retrieve_memories(
             memory_type=row[5],
             domain=row[6],
             id=str(row[7]) if row[7] is not None else None,
+            project_id=row[8],
         )
         for row in rows
     ]
@@ -530,3 +599,131 @@ def list_hot_memories(project_id: str = DEFAULT_PROJECT_ID, top_k: int = 10) -> 
         }
         for row in rows
     ]
+
+
+def _project_row_to_obj(row: tuple, with_count: bool = False) -> Project:
+    """Convert a raw projects row into a Project dataclass."""
+    created_at = row[5]
+    if isinstance(created_at, datetime):
+        created_at = created_at.isoformat()
+    archived_at = row[7]
+    if isinstance(archived_at, datetime):
+        archived_at = archived_at.isoformat()
+    memory_count = row[8] if with_count and len(row) > 8 else None
+    return Project(
+        project_id=row[0],
+        name=row[1],
+        project_type=row[2],
+        description=row[3],
+        tags=list(row[4] or []),
+        created_at=created_at,
+        created_by=row[6],
+        archived_at=archived_at,
+        memory_count=memory_count,
+    )
+
+
+def create_project(
+    project_id: str,
+    name: str,
+    project_type: str,
+    description: str | None = None,
+    tags: Sequence[str] | None = None,
+    created_by: str | None = None,
+) -> Project:
+    """Register a new project. Validates the slug and project_type at the Python layer
+    so callers get a clear error message before the DB-layer CHECK constraint fires.
+
+    Raises:
+        ValueError: If ``project_id`` is not a slug, or ``project_type`` is not in PROJECT_TYPES.
+        psycopg2.errors.UniqueViolation: If ``project_id`` already exists.
+    """
+    if not PROJECT_ID_SLUG.match(project_id):
+        raise ValueError(
+            f"project_id {project_id!r} must match {PROJECT_ID_SLUG.pattern} "
+            "(lowercase letters, digits, dashes; must start with letter or digit)."
+        )
+    if project_type not in PROJECT_TYPES:
+        raise ValueError(
+            f"project_type {project_type!r} must be one of {list(PROJECT_TYPES)}."
+        )
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                CREATE_PROJECT_SQL,
+                {
+                    "project_id": project_id,
+                    "name": name,
+                    "project_type": project_type,
+                    "description": description,
+                    "tags": list(tags or []),
+                    "created_by": created_by,
+                },
+            )
+            row = cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    return _project_row_to_obj(row)
+
+
+def list_projects(include_archived: bool = False) -> list[Project]:
+    """Return all projects, sorted active-first by creation time.
+
+    Each Project has its current ``memory_count`` populated via a LEFT JOIN.
+    """
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(LIST_PROJECTS_SQL, {"include_archived": include_archived})
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [_project_row_to_obj(row, with_count=True) for row in rows]
+
+
+def get_project(project_id: str) -> Project | None:
+    """Return one project by id, including ``memory_count``, or None if not found."""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(GET_PROJECT_SQL, {"project_id": project_id})
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return _project_row_to_obj(row, with_count=True)
+
+
+def archive_project(project_id: str) -> Project | None:
+    """Soft-delete a project by setting ``archived_at = NOW()``.
+
+    Memory rows for the project are NOT deleted — they remain queryable via the
+    archived project_id. Returns None if the project doesn't exist or is already archived.
+    """
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(ARCHIVE_PROJECT_SQL, {"project_id": project_id})
+            row = cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    archived_at = row[3]
+    if isinstance(archived_at, datetime):
+        archived_at = archived_at.isoformat()
+    return Project(
+        project_id=row[0],
+        name=row[1],
+        project_type=row[2],
+        description=None,
+        tags=[],
+        created_at=None,
+        created_by=None,
+        archived_at=archived_at,
+        memory_count=None,
+    )
