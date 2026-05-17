@@ -87,4 +87,4 @@ def stats(project_id: str = "memory-kb-poc") -> dict[str, Any]:
 if __name__ == "__main__":
     mcp.settings.host = os.environ.get("DATABRICKS_APP_HOST", "0.0.0.0")
     mcp.settings.port = int(os.environ.get("DATABRICKS_APP_PORT", "8000"))
-    mcp.run(transport="sse")
+    mcp.run(transport="streamable-http")
