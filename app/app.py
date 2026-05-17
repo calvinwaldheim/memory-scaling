@@ -5,12 +5,50 @@ from __future__ import annotations
 import os
 from typing import Any
 
+import httpx
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
+from pydantic import AnyHttpUrl
 
 from memory_agent import agent as memory_agent
 from memory_agent import embeddings, storage
 
-mcp = FastMCP("memory-scaling")
+WORKSPACE_URL = os.environ.get(
+    "DATABRICKS_WORKSPACE_URL",
+    "https://dbc-1223ae6c-4282.cloud.databricks.com",
+)
+APP_URL = os.environ.get(
+    "DATABRICKS_APP_URL",
+    "https://memory-scaling-mcp-7474648789573088.aws.databricksapps.com",
+)
+
+
+class DatabricksTokenVerifier(TokenVerifier):
+    async def verify_token(self, token: str) -> AccessToken | None:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{WORKSPACE_URL}/api/2.0/preview/scim/v2/Me",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        if r.status_code != 200:
+            return None
+        return AccessToken(
+            token=token,
+            client_id="claude",
+            scopes=["all-apis", "offline_access"],
+        )
+
+
+mcp = FastMCP(
+    "memory-scaling",
+    token_verifier=DatabricksTokenVerifier(),
+    auth=AuthSettings(
+        issuer_url=AnyHttpUrl(f"{WORKSPACE_URL}/oidc"),
+        resource_server_url=AnyHttpUrl(APP_URL),
+        required_scopes=["all-apis", "offline_access"],
+    ),
+)
 
 
 @mcp.tool()
