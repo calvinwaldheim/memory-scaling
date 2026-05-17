@@ -166,6 +166,12 @@ with psycopg2.connect(CONN_STRING, password=TOKEN) as conn, \
     rows = cur.fetchall()
 
 df = pd.DataFrame(rows)
+if df.empty:
+    # Nightly schedule will hit this whenever no new episodics have been
+    # written since the last distillation pass — that's the expected
+    # steady state, not a failure. Exit cleanly so the Job shows SUCCESS.
+    print(f"No undistilled episodic memories for project '{PROJECT_ID}'. Nothing to distill.")
+    dbutils.notebook.exit("no-op: no undistilled episodic memories")
 # pgvector returns "[0.1,0.2,...]" when cast to text
 df["embedding"] = df["embedding_text"].apply(
     lambda s: np.array(json.loads(s), dtype=np.float32)
@@ -193,7 +199,8 @@ df[["id", "domain", "context"]].head()
 # COMMAND ----------
 
 if len(df) < 2:
-    raise SystemExit("Not enough undistilled episodic memories to cluster — bootstrap more first.")
+    print(f"Only {len(df)} undistilled episodic memory for project '{PROJECT_ID}' — need ≥2 to cluster. Exiting cleanly.")
+    dbutils.notebook.exit("no-op: fewer than 2 undistilled episodic memories")
 
 X = np.stack(df["embedding"].values)
 
