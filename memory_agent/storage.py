@@ -61,7 +61,7 @@ UPDATABLE_FIELDS = ("rule", "domain", "quality_score", "memory_type", "scope")
 
 STATS_SQL = """
 WITH scoped AS (
-    SELECT memory_type, domain, created_at
+    SELECT memory_type, domain, created_at, retrieval_count, quality_score
     FROM memories
     WHERE project_id = %s
 ),
@@ -85,8 +85,23 @@ SELECT
     COUNT(*) AS total,
     (SELECT value FROM by_type) AS by_memory_type,
     (SELECT value FROM by_domain) AS by_domain,
-    MAX(created_at) AS last_written_at
+    MAX(created_at) AS last_written_at,
+    MIN(created_at) AS first_written_at,
+    COUNT(*) FILTER (WHERE COALESCE(retrieval_count, 0) = 0) AS cold_count,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(retrieval_count, 0)) AS retrieval_count_p50,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY COALESCE(retrieval_count, 0)) AS retrieval_count_p90,
+    MAX(retrieval_count) AS retrieval_count_max,
+    AVG(quality_score) AS avg_quality_score
 FROM scoped
+"""
+
+LIST_HOT_MEMORIES_SQL = """
+SELECT id, rule, context, memory_type, domain, quality_score, retrieval_count, created_at
+FROM memories
+WHERE project_id = %(project_id)s
+  AND COALESCE(retrieval_count, 0) > 0
+ORDER BY retrieval_count DESC, created_at DESC
+LIMIT %(top_k)s
 """
 
 
@@ -120,6 +135,12 @@ class MemoryStats:
     by_memory_type: dict[str, int]
     by_domain: dict[str, int]
     last_written_at: str | None
+    first_written_at: str | None = None
+    cold_count: int = 0
+    retrieval_count_p50: float | None = None
+    retrieval_count_p90: float | None = None
+    retrieval_count_max: int | None = None
+    avg_quality_score: float | None = None
 
 
 def _lakebase_endpoint(project_name: str) -> str:
@@ -441,15 +462,71 @@ def stats(project_id: str = DEFAULT_PROJECT_ID) -> MemoryStats:
     cur = conn.cursor()
     try:
         cur.execute(STATS_SQL, (project_id,))
-        total, by_memory_type, by_domain, last_written_at = cur.fetchone()
+        (
+            total,
+            by_memory_type,
+            by_domain,
+            last_written_at,
+            first_written_at,
+            cold_count,
+            retrieval_count_p50,
+            retrieval_count_p90,
+            retrieval_count_max,
+            avg_quality_score,
+        ) = cur.fetchone()
         if isinstance(last_written_at, datetime):
             last_written_at = last_written_at.isoformat()
+        if isinstance(first_written_at, datetime):
+            first_written_at = first_written_at.isoformat()
         return MemoryStats(
             total=total or 0,
             by_memory_type=dict(by_memory_type or {}),
             by_domain=dict(by_domain or {}),
             last_written_at=last_written_at,
+            first_written_at=first_written_at,
+            cold_count=int(cold_count or 0),
+            retrieval_count_p50=float(retrieval_count_p50) if retrieval_count_p50 is not None else None,
+            retrieval_count_p90=float(retrieval_count_p90) if retrieval_count_p90 is not None else None,
+            retrieval_count_max=int(retrieval_count_max) if retrieval_count_max is not None else None,
+            avg_quality_score=float(avg_quality_score) if avg_quality_score is not None else None,
         )
     finally:
         cur.close()
         conn.close()
+
+
+def list_hot_memories(project_id: str = DEFAULT_PROJECT_ID, top_k: int = 10) -> list[dict]:
+    """Return memories sorted by ``retrieval_count`` DESC, then ``created_at`` DESC.
+
+    Skips rows with ``retrieval_count = 0`` so callers see only memories that have
+    actually been used. Useful for hot-set inspection and as the data feed for
+    a future pruning rule (cold-and-low-quality → archive).
+
+    Args:
+        project_id: Project identifier filter.
+        top_k: Maximum number of rows to return.
+
+    Returns:
+        Each item is a dict with ``id``, ``rule``, ``content``, ``memory_type``,
+        ``domain``, ``quality_score``, ``retrieval_count``, ``created_at``.
+    """
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(LIST_HOT_MEMORIES_SQL, {"project_id": project_id, "top_k": top_k})
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "id": str(row[0]),
+            "rule": row[1],
+            "content": row[2],
+            "memory_type": row[3],
+            "domain": row[4],
+            "quality_score": row[5],
+            "retrieval_count": row[6] or 0,
+            "created_at": row[7].isoformat() if isinstance(row[7], datetime) else row[7],
+        }
+        for row in rows
+    ]

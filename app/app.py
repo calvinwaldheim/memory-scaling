@@ -182,9 +182,11 @@ def update_memory(
 
 @mcp.tool()
 def stats(project_id: str = "memory-kb-poc") -> dict[str, Any]:
-    """Summarize the current contents of the memory store for one project.
+    """Summarize the current contents and usage of the memory store for one project.
 
-    Call this when an agent needs a quick health or inventory check before relying on the memory base. The return value is `{"total": N, "by_memory_type": {...}, "by_domain": {...}, "last_written_at": "..."}` where `last_written_at` is an ISO timestamp string or `None` if the project has no memories yet.
+    Call this when an agent needs a quick health, inventory, or usage check before relying on or curating the memory base.
+
+    The return value includes inventory fields (`total`, `by_memory_type`, `by_domain`, `first_written_at`, `last_written_at`), usage fields driven by `retrieval_count` (`cold_count` — memories never retrieved, `retrieval_count_p50` / `_p90` / `_max`), and a quality summary (`avg_quality_score`). All timestamps are ISO strings or `None`. A high `cold_count` relative to `total` is a signal that pruning would be productive.
     """
     summary = storage.stats(project_id=project_id)
     return {
@@ -192,7 +194,24 @@ def stats(project_id: str = "memory-kb-poc") -> dict[str, Any]:
         "by_memory_type": summary.by_memory_type,
         "by_domain": summary.by_domain,
         "last_written_at": summary.last_written_at,
+        "first_written_at": summary.first_written_at,
+        "cold_count": summary.cold_count,
+        "retrieval_count_p50": summary.retrieval_count_p50,
+        "retrieval_count_p90": summary.retrieval_count_p90,
+        "retrieval_count_max": summary.retrieval_count_max,
+        "avg_quality_score": summary.avg_quality_score,
     }
+
+
+@mcp.tool()
+def list_hot(top_k: int = 10, project_id: str = "memory-kb-poc") -> list[dict[str, Any]]:
+    """List the most-retrieved memories, sorted by `retrieval_count` (descending).
+
+    Use this to see what the memory store is actually being used for — i.e. which rules and contexts agents keep pulling back. Memories with `retrieval_count = 0` are excluded; if no memory has been retrieved yet, the list is empty. Pair with `stats` to gauge how concentrated usage is (e.g. p90 ≫ p50 implies a long tail).
+
+    Each item contains `id`, `rule`, `content`, `memory_type`, `domain`, `quality_score`, `retrieval_count`, and `created_at`.
+    """
+    return storage.list_hot_memories(project_id=project_id, top_k=top_k)
 
 
 if __name__ == "__main__":
