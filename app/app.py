@@ -93,7 +93,7 @@ class DatabricksTokenVerifier(TokenVerifier):
         return DatabricksAccessToken(
             token=token,
             client_id="claude",
-            scopes=["all-apis", "offline_access"],
+            scopes=["postgres"],
             user_name=user_name,
         )
 
@@ -160,7 +160,11 @@ else:
         auth=AuthSettings(
             issuer_url=AnyHttpUrl(f"{WORKSPACE_URL}/oidc"),
             resource_server_url=AnyHttpUrl(APP_URL),
-            required_scopes=["all-apis", "offline_access"],
+            # Databricks Apps OAuth retired `all-apis` and `offline_access` in favor of
+            # fine-grained per-resource scopes. Our app only needs `postgres` (for
+            # Lakebase credential minting via /api/2.0/postgres/credentials); SCIM
+            # /Me self-info works on any valid token regardless of scope.
+            required_scopes=["postgres"],
         ),
     )
 
