@@ -1,5 +1,7 @@
 # Migration Guide
 
+> **Historical snapshot.** This document records the original notebook → `memory_agent` package refactor and the `001_schema_hardening` migration. Two more migrations have shipped since: `002_projects.sql` (multi-project registry) and `003_supersede_lineage.sql` (supersede + soft-forget + lineage columns). See [`migrations/`](migrations/) for the full set in numerical order. Current usage lives in [`README.md`](README.md); Claude-facing operating manual in [`AGENT.md`](AGENT.md). The original content is preserved below verbatim.
+
 This refactor moves notebook business logic from `02_bootstrap`, `03_retrieval`, and `04_agent` into a reusable `memory_agent/` package while preserving observed behavior from the notebooks.
 
 ## Notebook-to-module mapping

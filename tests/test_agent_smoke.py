@@ -10,10 +10,20 @@ def test_answer_runs_retrieve_generate_writeback(monkeypatch) -> None:
     def fake_embed_text(text: str) -> list[float]:
         return [0.1, 0.2] if text.startswith("What") else [0.3, 0.4]
 
-    def fake_retrieve_memories(query_embedding, project_id: str, top_k: int):
+    def fake_retrieve_memories(
+        query_embedding,
+        project_id: str,
+        top_k: int,
+        project_ids=None,
+        memory_type=None,
+        domain=None,
+        min_quality_score=None,
+        include_inactive: bool = False,
+    ):
         assert query_embedding == [0.1, 0.2]
         assert project_id == "memory-kb-poc"
         assert top_k == 3
+        assert include_inactive is False
         return [
             RetrievedMemory("r1", "ctx one", 0.8, 0.2),
             RetrievedMemory("r2", "ctx two", 0.7, 0.3),

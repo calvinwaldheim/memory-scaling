@@ -33,12 +33,14 @@ ON CONFLICT DO NOTHING
 RETRIEVE_MEMORIES_SQL = """
 SELECT rule, context, quality_score,
        embedding <=> %(emb)s::vector AS distance,
-       source_ref, memory_type, domain, id, project_id
+       source_ref, memory_type, domain, id, project_id,
+       superseded_at, superseded_by, forgotten_at
 FROM memories
 WHERE project_id = ANY(%(project_ids)s::text[])
   AND (%(memory_type)s::text IS NULL OR memory_type = %(memory_type)s)
   AND (%(domain)s::text IS NULL OR domain = %(domain)s)
   AND (%(min_quality_score)s::float IS NULL OR quality_score >= %(min_quality_score)s)
+  AND (%(include_inactive)s::boolean OR (superseded_at IS NULL AND forgotten_at IS NULL))
 ORDER BY distance ASC
 LIMIT %(top_k)s
 """
@@ -55,9 +57,118 @@ WHERE id = %(id)s::uuid
 RETURNING id, rule, context, memory_type, domain, scope, quality_score
 """
 
+# Soft-forget: mark a memory as retracted without removing the row. Audit fields
+# stay populated so we can answer "what did we believe on date X, and when did
+# we change our minds". Only flips rows that are currently active; the caller
+# disambiguates "not_found" vs "already_forgotten" via a follow-up SELECT.
+SOFT_FORGET_MEMORY_SQL = """
+UPDATE memories
+SET forgotten_at = NOW(),
+    forgotten_reason = %(reason)s,
+    forgotten_by_user = %(user_id)s,
+    updated_at = NOW()
+WHERE id = %(id)s::uuid
+  AND forgotten_at IS NULL
+RETURNING id, rule, context, memory_type, domain, scope, quality_score,
+          forgotten_at, forgotten_reason, forgotten_by_user
+"""
+
+# Read-only probe used when SOFT_FORGET_MEMORY_SQL updates zero rows: tells us
+# whether the id is unknown or already forgotten.
+GET_MEMORY_FORGOTTEN_STATE_SQL = """
+SELECT id, forgotten_at, forgotten_reason, forgotten_by_user
+FROM memories
+WHERE id = %(id)s::uuid
+"""
+
+# Row-lock the old memory before we decide whether to supersede it.
+LOCK_MEMORY_FOR_SUPERSEDE_SQL = """
+SELECT id, project_id, project_type, memory_type, scope, user_id, domain,
+       rule, superseded_at, superseded_by, forgotten_at
+FROM memories
+WHERE id = %(id)s::uuid
+FOR UPDATE
+"""
+
+# Insert the replacement memory inside the same transaction as the old row's
+# lock. Mirrors INSERT_MEMORY_SQL but RETURNS the new id so we can patch the
+# old row's superseded_by FK in the same transaction. ``derived_from`` is
+# nullable — populated by the distillation pipeline when a semantic memory
+# supersedes a previous semantic for the same cluster.
+INSERT_SUPERSEDE_MEMORY_SQL = """
+INSERT INTO memories
+    (project_id, project_type, memory_type, scope, user_id, domain, rule,
+     context, source_ref, content_hash, embedding, quality_score, derived_from)
+VALUES
+    (%(project_id)s, %(project_type)s, %(memory_type)s, %(scope)s, %(user_id)s,
+     %(domain)s, %(rule)s, %(context)s, %(source_ref)s, %(content_hash)s,
+     %(embedding)s, %(quality_score)s, %(derived_from)s::uuid[])
+ON CONFLICT (project_id, content_hash) DO NOTHING
+RETURNING id
+"""
+
+MARK_SUPERSEDED_SQL = """
+UPDATE memories
+SET superseded_by = %(new_id)s::uuid,
+    superseded_at = NOW(),
+    superseded_reason = %(reason)s,
+    superseded_by_user = %(user_id)s,
+    updated_at = NOW()
+WHERE id = %(old_id)s::uuid
+RETURNING id, superseded_at
+"""
+
+# Walk forward from the given id to the chain head (the row with
+# superseded_at IS NULL is the live one). Postgres recursive CTE.
+LINEAGE_FORWARD_SQL = """
+WITH RECURSIVE chain AS (
+    SELECT id, superseded_by, superseded_at, superseded_reason, superseded_by_user,
+           forgotten_at, rule, context, memory_type, domain, scope, quality_score,
+           created_at, 0 AS depth
+    FROM memories
+    WHERE id = %(id)s::uuid
+  UNION ALL
+    SELECT m.id, m.superseded_by, m.superseded_at, m.superseded_reason, m.superseded_by_user,
+           m.forgotten_at, m.rule, m.context, m.memory_type, m.domain, m.scope, m.quality_score,
+           m.created_at, chain.depth + 1
+    FROM memories m
+    JOIN chain ON m.id = chain.superseded_by
+    WHERE chain.depth < 64
+)
+SELECT id, superseded_by, superseded_at, superseded_reason, superseded_by_user,
+       forgotten_at, rule, context, memory_type, domain, scope, quality_score,
+       created_at, depth
+FROM chain
+ORDER BY depth ASC
+"""
+
+# Walk backward: every row that (transitively) points its superseded_by at the
+# given id is an ancestor. Used for "what beliefs did this one replace".
+LINEAGE_BACKWARD_SQL = """
+WITH RECURSIVE ancestors AS (
+    SELECT id, superseded_by, superseded_at, superseded_reason, superseded_by_user,
+           forgotten_at, rule, context, memory_type, domain, scope, quality_score,
+           created_at, 1 AS depth
+    FROM memories
+    WHERE superseded_by = %(id)s::uuid
+  UNION ALL
+    SELECT m.id, m.superseded_by, m.superseded_at, m.superseded_reason, m.superseded_by_user,
+           m.forgotten_at, m.rule, m.context, m.memory_type, m.domain, m.scope, m.quality_score,
+           m.created_at, ancestors.depth + 1
+    FROM memories m
+    JOIN ancestors ON m.superseded_by = ancestors.id
+    WHERE ancestors.depth < 64
+)
+SELECT id, superseded_by, superseded_at, superseded_reason, superseded_by_user,
+       forgotten_at, rule, context, memory_type, domain, scope, quality_score,
+       created_at, depth
+FROM ancestors
+ORDER BY depth ASC
+"""
+
 # Fields that update_memory_fields() is allowed to overwrite. `context` is
 # intentionally excluded because changing it would invalidate the stored
-# embedding and content_hash — model that as forget + remember instead.
+# embedding and content_hash — model that as supersede instead.
 UPDATABLE_FIELDS = ("rule", "domain", "quality_score", "memory_type", "scope")
 
 PROJECT_TYPES = ("data_domain", "engineering", "compliance", "customer", "product")
@@ -100,7 +211,8 @@ RETURNING project_id, name, project_type, archived_at
 
 STATS_SQL = """
 WITH scoped AS (
-    SELECT memory_type, domain, created_at, retrieval_count, quality_score
+    SELECT memory_type, domain, created_at, retrieval_count, quality_score,
+           superseded_at, forgotten_at
     FROM memories
     WHERE project_id = %s
 ),
@@ -130,7 +242,10 @@ SELECT
     PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(retrieval_count, 0)) AS retrieval_count_p50,
     PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY COALESCE(retrieval_count, 0)) AS retrieval_count_p90,
     MAX(retrieval_count) AS retrieval_count_max,
-    AVG(quality_score) AS avg_quality_score
+    AVG(quality_score) AS avg_quality_score,
+    COUNT(*) FILTER (WHERE superseded_at IS NOT NULL) AS superseded_count,
+    COUNT(*) FILTER (WHERE forgotten_at IS NOT NULL) AS forgotten_count,
+    COUNT(*) FILTER (WHERE superseded_at IS NULL AND forgotten_at IS NULL) AS active_count
 FROM scoped
 """
 
@@ -157,6 +272,39 @@ class RetrievedMemory:
     domain: str | None = None
     id: str | None = None
     project_id: str | None = None
+    superseded_at: str | None = None
+    superseded_by: str | None = None
+    forgotten_at: str | None = None
+
+
+@dataclass(frozen=True)
+class LineageNode:
+    """One row in a supersede/forget audit chain."""
+
+    id: str
+    rule: str | None
+    context: str
+    memory_type: str | None
+    domain: str | None
+    scope: str | None
+    quality_score: float | None
+    superseded_by: str | None
+    superseded_at: str | None
+    superseded_reason: str | None
+    superseded_by_user: str | None
+    forgotten_at: str | None
+    created_at: str | None
+    depth: int
+
+
+@dataclass(frozen=True)
+class Lineage:
+    """Full supersede history for one target memory."""
+
+    target_id: str
+    head_id: str | None
+    chain: list[LineageNode]
+    ancestors: list[LineageNode]
 
 
 @dataclass(frozen=True)
@@ -196,6 +344,9 @@ class MemoryStats:
     retrieval_count_p90: float | None = None
     retrieval_count_max: int | None = None
     avg_quality_score: float | None = None
+    superseded_count: int = 0
+    forgotten_count: int = 0
+    active_count: int = 0
 
 
 def _lakebase_endpoint(project_name: str) -> str:
@@ -342,6 +493,7 @@ def retrieve_memories(
     memory_type: str | None = None,
     domain: str | None = None,
     min_quality_score: float | None = None,
+    include_inactive: bool = False,
 ) -> list[RetrievedMemory]:
     """Retrieve the top-k similar memories using pgvector cosine distance.
 
@@ -356,6 +508,9 @@ def retrieve_memories(
         memory_type: Optional exact-match filter on ``memory_type`` (``"episodic"`` or ``"semantic"``).
         domain: Optional exact-match filter on ``domain``.
         min_quality_score: Optional inclusive lower bound on ``quality_score``.
+        include_inactive: When True, also return rows that are superseded or soft-forgotten.
+            Default False keeps retrieval focused on the live believed-true subset; flip to True
+            for audit queries that need to inspect history.
 
     Returns:
         Retrieved memory rows sorted by ascending cosine distance. Each row carries
@@ -383,6 +538,7 @@ def retrieve_memories(
                 "memory_type": memory_type,
                 "domain": domain,
                 "min_quality_score": min_quality_score,
+                "include_inactive": include_inactive,
             },
         )
         rows = cur.fetchall()
@@ -400,6 +556,9 @@ def retrieve_memories(
             domain=row[6],
             id=str(row[7]) if row[7] is not None else None,
             project_id=row[8],
+            superseded_at=row[9].isoformat() if isinstance(row[9], datetime) else row[9],
+            superseded_by=str(row[10]) if row[10] is not None else None,
+            forgotten_at=row[11].isoformat() if isinstance(row[11], datetime) else row[11],
         )
         for row in rows
     ]
@@ -432,7 +591,11 @@ def bump_retrieval_counts(memory_ids: Sequence[str]) -> int:
 
 
 def delete_memory(memory_id: str) -> dict | None:
-    """Hard-delete one memory row by id.
+    """Hard-delete one memory row by id (audit-destroying).
+
+    Reserved for the ``hard=True`` opt-in path on ``forget`` and the future
+    pruning job that reclaims rows past their retention window. Prefer
+    ``soft_forget_memory`` for routine retraction — it keeps the audit trail.
 
     Args:
         memory_id: UUID string of the row to remove.
@@ -463,6 +626,294 @@ def delete_memory(memory_id: str) -> dict | None:
         "scope": row[5],
         "quality_score": row[6],
     }
+
+
+def soft_forget_memory(
+    memory_id: str,
+    reason: str | None = None,
+    user_id: str | None = None,
+) -> dict:
+    """Mark one memory as retracted without removing the row.
+
+    The row stays in the database but is excluded from default ``retrieve_memories``
+    results, so semantically-similar queries no longer surface it. Audit fields
+    (``forgotten_at``, ``forgotten_reason``, ``forgotten_by_user``) record the
+    retraction.
+
+    Args:
+        memory_id: UUID string of the row to retract.
+        reason: Free-text rationale (recommended). Stored verbatim.
+        user_id: Attribution string for the actor who retracted it.
+
+    Returns:
+        A dict with ``status`` ∈ {``"forgotten"``, ``"already_forgotten"``, ``"not_found"``},
+        plus the memory's fields when applicable.
+
+    Raises:
+        psycopg2.Error: If the database connection or update fails.
+    """
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                SOFT_FORGET_MEMORY_SQL,
+                {"id": memory_id, "reason": reason, "user_id": user_id},
+            )
+            row = cur.fetchone()
+            if row is not None:
+                conn.commit()
+                forgotten_at = row[7]
+                if isinstance(forgotten_at, datetime):
+                    forgotten_at = forgotten_at.isoformat()
+                return {
+                    "status": "forgotten",
+                    "id": str(row[0]),
+                    "rule": row[1],
+                    "context": row[2],
+                    "memory_type": row[3],
+                    "domain": row[4],
+                    "scope": row[5],
+                    "quality_score": row[6],
+                    "forgotten_at": forgotten_at,
+                    "forgotten_reason": row[8],
+                    "forgotten_by_user": row[9],
+                }
+            # Zero rows updated: either unknown id, or already forgotten.
+            cur.execute(GET_MEMORY_FORGOTTEN_STATE_SQL, {"id": memory_id})
+            probe = cur.fetchone()
+    finally:
+        conn.close()
+    if probe is None:
+        return {"status": "not_found", "memory_id": memory_id}
+    forgotten_at = probe[1]
+    if isinstance(forgotten_at, datetime):
+        forgotten_at = forgotten_at.isoformat()
+    return {
+        "status": "already_forgotten",
+        "id": str(probe[0]),
+        "forgotten_at": forgotten_at,
+        "forgotten_reason": probe[2],
+        "forgotten_by_user": probe[3],
+    }
+
+
+def _walk_to_head(cur, start_id: str) -> tuple[str | None, list[tuple]]:
+    """Walk the supersede chain forward from ``start_id`` and return (head_id, rows).
+
+    ``head_id`` is the id of the live row in the chain (its ``superseded_at`` is NULL),
+    or None if the starting row itself is unknown.
+    """
+    cur.execute(LINEAGE_FORWARD_SQL, {"id": start_id})
+    rows = cur.fetchall()
+    if not rows:
+        return None, []
+    head_id: str | None = None
+    for row in rows:
+        if row[2] is None:  # superseded_at IS NULL ⇒ live row
+            head_id = str(row[0])
+    if head_id is None and rows:
+        # Defensive: deepest row in the chain. Real data should always end at a live row,
+        # but if a chain was truncated by a hard-purge of the head, fall back to deepest.
+        head_id = str(rows[-1][0])
+    return head_id, rows
+
+
+def supersede_memory(
+    old_id: str,
+    new_content: str,
+    embedding: Sequence[float],
+    reason: str,
+    user_id: str | None = None,
+    rule: str | None = None,
+    quality_score: float | None = None,
+    source_ref: str | None = None,
+    memory_type: str | None = None,
+    scope: str | None = None,
+    domain: str | None = None,
+    derived_from: Sequence[str] | None = None,
+) -> dict:
+    """Atomically replace one memory with a corrected version, preserving lineage.
+
+    The replacement memory inherits ``project_id``, ``project_type``, ``user_id``,
+    ``memory_type``, ``scope``, and ``domain`` from the old row unless explicitly
+    overridden. The ``superseded_by`` FK on the old row is patched to point at
+    the new row in the same transaction, so retrieval never sees an interim state.
+
+    Args:
+        old_id: UUID string of the memory being corrected.
+        new_content: The corrected content. Will be embedded and stored as a new row.
+        embedding: Pre-computed embedding for ``new_content``. Caller (MCP layer) owns
+            the embedding model so storage stays embedding-model-agnostic.
+        reason: Free-text rationale (required — supersedence without a reason is
+            indistinguishable from churn in audit reports).
+        user_id: Attribution string for the actor who superseded.
+        rule, quality_score, source_ref, memory_type, scope, domain: Optional
+            per-field overrides on the new row. Unset fields inherit from the old row.
+
+    Returns:
+        A dict with ``status`` and supporting fields. Possible statuses:
+        - ``"superseded"`` — success; includes ``old_id``, ``new_id``, ``head_id``.
+        - ``"not_found"`` — ``old_id`` doesn't exist.
+        - ``"already_superseded"`` — old row was already replaced; includes
+          ``current_head_id`` so the caller can re-read and decide whether to
+          re-supersede the head.
+        - ``"forgotten"`` — old row was soft-forgotten; caller should call
+          ``remember`` instead of trying to chain off a retracted belief.
+        - ``"duplicate_content"`` — the new content_hash collides with an existing
+          row in the same project. Caller should reword or forget the colliding row.
+
+    Raises:
+        psycopg2.Error: If the database connection or any statement fails. The
+            transaction is rolled back automatically on failure.
+    """
+    content_hash = hashlib.md5(new_content.encode()).hexdigest()
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(LOCK_MEMORY_FOR_SUPERSEDE_SQL, {"id": old_id})
+            locked = cur.fetchone()
+            if locked is None:
+                conn.rollback()
+                return {"status": "not_found", "memory_id": old_id}
+
+            (
+                _,
+                old_project_id,
+                old_project_type,
+                old_memory_type,
+                old_scope,
+                old_user_id,
+                old_domain,
+                old_rule,
+                old_superseded_at,
+                _old_superseded_by,
+                old_forgotten_at,
+            ) = locked
+
+            if old_forgotten_at is not None:
+                conn.rollback()
+                return {"status": "forgotten", "memory_id": old_id}
+
+            if old_superseded_at is not None:
+                head_id, _rows = _walk_to_head(cur, old_id)
+                conn.rollback()
+                return {
+                    "status": "already_superseded",
+                    "memory_id": old_id,
+                    "current_head_id": head_id,
+                }
+
+            cur.execute(
+                INSERT_SUPERSEDE_MEMORY_SQL,
+                {
+                    "project_id": old_project_id,
+                    "project_type": old_project_type,
+                    "memory_type": memory_type if memory_type is not None else old_memory_type,
+                    "scope": scope if scope is not None else old_scope,
+                    "user_id": old_user_id,
+                    "domain": domain if domain is not None else old_domain,
+                    "rule": rule if rule is not None else old_rule,
+                    "context": new_content,
+                    "source_ref": source_ref,
+                    "content_hash": content_hash,
+                    "embedding": json.dumps(list(embedding)),
+                    "quality_score": quality_score if quality_score is not None else 0.5,
+                    "derived_from": list(derived_from) if derived_from is not None else None,
+                },
+            )
+            inserted = cur.fetchone()
+            if inserted is None:
+                conn.rollback()
+                return {
+                    "status": "duplicate_content",
+                    "memory_id": old_id,
+                    "content_hash": content_hash,
+                }
+            new_id = str(inserted[0])
+
+            cur.execute(
+                MARK_SUPERSEDED_SQL,
+                {
+                    "old_id": old_id,
+                    "new_id": new_id,
+                    "reason": reason,
+                    "user_id": user_id,
+                },
+            )
+            marked = cur.fetchone()
+            if marked is None:
+                conn.rollback()
+                return {"status": "not_found", "memory_id": old_id}
+            superseded_at = marked[1]
+            if isinstance(superseded_at, datetime):
+                superseded_at = superseded_at.isoformat()
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "status": "superseded",
+        "old_id": old_id,
+        "new_id": new_id,
+        "head_id": new_id,
+        "superseded_at": superseded_at,
+        "content_hash": content_hash,
+    }
+
+
+def _lineage_row_to_node(row: tuple) -> LineageNode:
+    superseded_at = row[2]
+    if isinstance(superseded_at, datetime):
+        superseded_at = superseded_at.isoformat()
+    forgotten_at = row[5]
+    if isinstance(forgotten_at, datetime):
+        forgotten_at = forgotten_at.isoformat()
+    created_at = row[12]
+    if isinstance(created_at, datetime):
+        created_at = created_at.isoformat()
+    return LineageNode(
+        id=str(row[0]),
+        superseded_by=str(row[1]) if row[1] is not None else None,
+        superseded_at=superseded_at,
+        superseded_reason=row[3],
+        superseded_by_user=row[4],
+        forgotten_at=forgotten_at,
+        rule=row[6],
+        context=row[7],
+        memory_type=row[8],
+        domain=row[9],
+        scope=row[10],
+        quality_score=row[11],
+        created_at=created_at,
+        depth=int(row[13]),
+    )
+
+
+def get_lineage(memory_id: str) -> Lineage | None:
+    """Return the supersede chain and ancestor tree for one memory.
+
+    ``chain`` is the forward walk starting from ``memory_id`` (depth 0) through each
+    successive ``superseded_by`` pointer until the live head row. ``ancestors``
+    is the recursive backward walk of every row that (transitively) was replaced
+    by ``memory_id``.
+
+    Returns ``None`` if ``memory_id`` doesn't exist.
+    """
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            head_id, forward_rows = _walk_to_head(cur, memory_id)
+            if not forward_rows:
+                return None
+            cur.execute(LINEAGE_BACKWARD_SQL, {"id": memory_id})
+            backward_rows = cur.fetchall()
+    finally:
+        conn.close()
+    return Lineage(
+        target_id=memory_id,
+        head_id=head_id,
+        chain=[_lineage_row_to_node(r) for r in forward_rows],
+        ancestors=[_lineage_row_to_node(r) for r in backward_rows],
+    )
 
 
 def update_memory_fields(memory_id: str, **fields: object) -> dict | None:
@@ -542,6 +993,9 @@ def stats(project_id: str = DEFAULT_PROJECT_ID) -> MemoryStats:
             retrieval_count_p90,
             retrieval_count_max,
             avg_quality_score,
+            superseded_count,
+            forgotten_count,
+            active_count,
         ) = cur.fetchone()
         if isinstance(last_written_at, datetime):
             last_written_at = last_written_at.isoformat()
@@ -558,6 +1012,9 @@ def stats(project_id: str = DEFAULT_PROJECT_ID) -> MemoryStats:
             retrieval_count_p90=float(retrieval_count_p90) if retrieval_count_p90 is not None else None,
             retrieval_count_max=int(retrieval_count_max) if retrieval_count_max is not None else None,
             avg_quality_score=float(avg_quality_score) if avg_quality_score is not None else None,
+            superseded_count=int(superseded_count or 0),
+            forgotten_count=int(forgotten_count or 0),
+            active_count=int(active_count or 0),
         )
     finally:
         cur.close()

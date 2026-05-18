@@ -89,16 +89,19 @@ def recall(
     memory_type: str | None = None,
     domain: str | None = None,
     min_quality_score: float | None = None,
+    include_inactive: bool = False,
 ) -> list[dict[str, Any]]:
     """Retrieve the nearest stored memories for a query.
 
-    Call this when an agent needs grounded context from the memory store before answering or planning. The return value is a ranked list of memory dictionaries. Each item contains `id`, `content`, `source_ref`, `memory_type`, `domain`, `rule`, `quality_score`, `distance`, and `project_id`; lower `distance` means a closer match.
+    Call this when an agent needs grounded context from the memory store before answering or planning. The return value is a ranked list of memory dictionaries. Each item contains `id`, `content`, `source_ref`, `memory_type`, `domain`, `rule`, `quality_score`, `distance`, `project_id`, plus lineage fields `superseded_at`, `superseded_by`, and `forgotten_at` (all `None` for live rows). Lower `distance` means a closer match.
 
     Project targeting (in precedence order):
     - `project_ids` (list): search across multiple projects in one call, e.g. recalling across every customer-type project.
     - `project_id` (single string): explicit override for one project.
     - Active project (set via `set_active_project`).
     - `DEFAULT_PROJECT_ID` env var.
+
+    Default behavior **excludes** rows that have been superseded (replaced by a corrected version) or soft-forgotten (retracted without replacement). This is what you almost always want — it keeps stale/wrong beliefs out of the retrieval window even though they remain in the table for audit. Pass `include_inactive=True` to also surface historical rows (use for audit, lineage inspection, "what did we believe on date X" queries).
 
     Side effect: each returned row's `retrieval_count` is incremented so future consolidation/pruning can prefer hot memories.
 
@@ -118,6 +121,7 @@ def recall(
         memory_type=memory_type,
         domain=domain,
         min_quality_score=min_quality_score,
+        include_inactive=include_inactive,
     )
     return [
         {
@@ -130,6 +134,9 @@ def recall(
             "quality_score": memory.quality_score,
             "distance": memory.distance,
             "project_id": memory.project_id,
+            "superseded_at": memory.superseded_at,
+            "superseded_by": memory.superseded_by,
+            "forgotten_at": memory.forgotten_at,
         }
         for memory in memories
     ]
@@ -168,17 +175,133 @@ def remember(
 
 
 @mcp.tool()
-def forget(memory_id: str) -> dict[str, Any]:
-    """Delete one memory by id.
+def forget(
+    memory_id: str,
+    reason: str | None = None,
+    user_id: str | None = None,
+    hard: bool = False,
+) -> dict[str, Any]:
+    """Retract one memory. Soft by default — the row stays in the table for audit.
 
-    Use this when a memory is wrong, obsolete, or off-scope and should no longer be retrievable. The id comes from a prior `recall` result. The return value is the deleted row's fields (`id`, `rule`, `content`, `memory_type`, `domain`, `scope`, `quality_score`) so the caller can confirm what was removed; if no row matched the id, the response is `{"status": "not_found", "memory_id": "..."}`.
+    Use this when a memory is wrong, obsolete, or off-scope and should no longer surface in `recall`. The id comes from a prior `recall` result.
 
-    To correct a memory's content rather than discard it, call `forget` followed by `remember` with the new content — the embedding has to be recomputed for retrieval to find the new wording.
+    Default (`hard=False`) is a **soft retraction**: sets `forgotten_at`, `forgotten_reason`, and `forgotten_by_user` on the row. The memory is no longer returned by default `recall` queries, but the row stays in the database and can be inspected via `recall(..., include_inactive=True)` or `get_lineage`. This is the audit-preserving path and should be the default choice. Returns `{"status": "forgotten" | "already_forgotten" | "not_found", ...}`.
+
+    `hard=True` is a **destructive purge**: `DELETE FROM memories WHERE id = ?`. Use only for true erasure (GDPR right-to-be-forgotten, secret leaked into a memory, etc.). The row is gone — no audit trail, no recovery. Returns `{"status": "deleted", ...}` or `{"status": "not_found", ...}`.
+
+    To **correct** a memory's content rather than retract it, prefer `supersede` over `forget`+`remember` — it links the old to the new in one atomic transaction and preserves the chain.
+
+    Args:
+        memory_id: UUID string from a prior `recall` result.
+        reason: Free-text rationale. Optional but strongly recommended for soft retractions — anonymous deletes are noise in audit reports.
+        user_id: Attribution string for the actor retracting the memory.
+        hard: When True, hard-delete (audit-destroying). Default False (soft).
     """
-    deleted = storage.delete_memory(memory_id)
-    if deleted is None:
+    if hard:
+        deleted = storage.delete_memory(memory_id)
+        if deleted is None:
+            return {"status": "not_found", "memory_id": memory_id}
+        return {"status": "deleted", **deleted}
+    return storage.soft_forget_memory(memory_id, reason=reason, user_id=user_id)
+
+
+@mcp.tool()
+def supersede(
+    old_id: str,
+    new_content: str,
+    reason: str,
+    user_id: str | None = None,
+    rule: str | None = None,
+    quality_score: float | None = None,
+    source_ref: str | None = None,
+    memory_type: str | None = None,
+    scope: str | None = None,
+    domain: str | None = None,
+) -> dict[str, Any]:
+    """Atomically replace a memory with a corrected version, preserving lineage.
+
+    Use this whenever a memory's content has become wrong and you have the corrected wording. Compared to `forget` + `remember`, `supersede` is:
+    1. **Atomic.** Both rows are written/updated in one transaction — agents never observe a state where the fact is missing or duplicated.
+    2. **Audit-preserving.** The old row stays in the table with `superseded_by` pointing at the new row, `superseded_at` set, plus `superseded_reason` and `superseded_by_user`. The full chain is queryable via `get_lineage`.
+    3. **Contamination-free.** Default `recall` excludes superseded rows, so the wrong content never surfaces semantically.
+
+    The new memory **inherits** `project_id`, `project_type`, `user_id`, `memory_type`, `scope`, and `domain` from the old row, unless you explicitly override them. `rule`, `quality_score`, and `source_ref` are commonly worth setting — they describe the corrected belief, not the old one.
+
+    Multi-writer race handling: if another agent already superseded `old_id`, this call returns `{"status": "already_superseded", "current_head_id": <uuid>, ...}`. Re-read the head memory before deciding whether to supersede it — the latest version may already incorporate your correction or conflict with it.
+
+    Possible statuses in the return value:
+    - `"superseded"` — success. Includes `old_id`, `new_id`, `head_id` (== `new_id`), `superseded_at`, `content_hash`.
+    - `"already_superseded"` — old memory was already replaced. Includes `current_head_id`.
+    - `"forgotten"` — old memory has been soft-forgotten; you should `remember` the corrected version as a fresh row instead.
+    - `"duplicate_content"` — the new content hash collides with an existing memory in the same project. Reword or hard-forget the colliding row first.
+    - `"not_found"` — `old_id` doesn't exist.
+
+    Args:
+        old_id: UUID of the memory being corrected (from `recall`).
+        new_content: Corrected content. Will be embedded fresh.
+        reason: Free-text rationale (required). Stored verbatim on the old row.
+        user_id: Attribution string for the actor superseding the memory.
+        rule: Optional override for the new row's `rule` summary. Defaults to the old row's rule.
+        quality_score: Optional override (0.0–1.0). Defaults to 0.5 when the old row had no score.
+        source_ref: Optional source pointer for the new memory.
+        memory_type, scope, domain: Optional overrides; default to the old row's values.
+    """
+    embedding = embeddings.embed(new_content)
+    return storage.supersede_memory(
+        old_id=old_id,
+        new_content=new_content,
+        embedding=embedding,
+        reason=reason,
+        user_id=user_id,
+        rule=rule,
+        quality_score=quality_score,
+        source_ref=source_ref,
+        memory_type=memory_type,
+        scope=scope,
+        domain=domain,
+    )
+
+
+@mcp.tool()
+def get_lineage(memory_id: str) -> dict[str, Any]:
+    """Return the supersede chain and ancestor tree for one memory.
+
+    Use this to answer audit questions like "what did we believe before X, and when did we change our minds, and who changed them". Walks two directions:
+    - `chain`: forward from `memory_id` (depth 0) through each `superseded_by` pointer until the live head row (`superseded_at IS NULL`).
+    - `ancestors`: backward — every row that (transitively) was replaced by `memory_id`.
+
+    Each node in either list contains `id`, `rule`, `context`, `memory_type`, `domain`, `scope`, `quality_score`, `superseded_by`, `superseded_at`, `superseded_reason`, `superseded_by_user`, `forgotten_at`, `created_at`, and `depth`.
+
+    Returns `{"status": "not_found", "memory_id": "..."}` if the id doesn't exist.
+    """
+    lineage = storage.get_lineage(memory_id)
+    if lineage is None:
         return {"status": "not_found", "memory_id": memory_id}
-    return {"status": "deleted", **deleted}
+    return {
+        "target_id": lineage.target_id,
+        "head_id": lineage.head_id,
+        "chain": [_lineage_node_to_dict(n) for n in lineage.chain],
+        "ancestors": [_lineage_node_to_dict(n) for n in lineage.ancestors],
+    }
+
+
+def _lineage_node_to_dict(node: storage.LineageNode) -> dict[str, Any]:
+    return {
+        "id": node.id,
+        "rule": node.rule,
+        "context": node.context,
+        "memory_type": node.memory_type,
+        "domain": node.domain,
+        "scope": node.scope,
+        "quality_score": node.quality_score,
+        "superseded_by": node.superseded_by,
+        "superseded_at": node.superseded_at,
+        "superseded_reason": node.superseded_reason,
+        "superseded_by_user": node.superseded_by_user,
+        "forgotten_at": node.forgotten_at,
+        "created_at": node.created_at,
+        "depth": node.depth,
+    }
 
 
 @mcp.tool()
@@ -223,11 +346,16 @@ def stats(project_id: str | None = None) -> dict[str, Any]:
 
     Call this when an agent needs a quick health, inventory, or usage check before relying on or curating the memory base.
 
-    The return value includes inventory fields (`total`, `by_memory_type`, `by_domain`, `first_written_at`, `last_written_at`), usage fields driven by `retrieval_count` (`cold_count` — memories never retrieved, `retrieval_count_p50` / `_p90` / `_max`), and a quality summary (`avg_quality_score`). All timestamps are ISO strings or `None`. A high `cold_count` relative to `total` is a signal that pruning would be productive.
+    The return value includes inventory fields (`total`, `active_count`, `superseded_count`, `forgotten_count`, `by_memory_type`, `by_domain`, `first_written_at`, `last_written_at`), usage fields driven by `retrieval_count` (`cold_count` — memories never retrieved, `retrieval_count_p50` / `_p90` / `_max`), and a quality summary (`avg_quality_score`). All timestamps are ISO strings or `None`.
+
+    `total = active_count + superseded_count + forgotten_count`. A high `superseded_count + forgotten_count` share signals heavy churn (lots of corrections), while a high `cold_count` relative to `active_count` is a signal that pruning would be productive.
     """
     summary = storage.stats(project_id=_resolve_project_id(project_id))
     return {
         "total": summary.total,
+        "active_count": summary.active_count,
+        "superseded_count": summary.superseded_count,
+        "forgotten_count": summary.forgotten_count,
         "by_memory_type": summary.by_memory_type,
         "by_domain": summary.by_domain,
         "last_written_at": summary.last_written_at,
@@ -332,7 +460,7 @@ def archive_project(project_id: str) -> dict[str, Any]:
 def set_active_project(project_id: str) -> dict[str, Any]:
     """Set the active project for this conversation.
 
-    After this call, every subsequent `recall`, `remember`, `forget`, `update_memory`, `stats`, and `list_hot` invocation will default to this project unless the caller passes an explicit `project_id` (or `project_ids` list) override. The active project is forgotten when Claude Desktop quits.
+    After this call, every subsequent `recall`, `remember`, `forget`, `supersede`, `update_memory`, `stats`, and `list_hot` invocation will default to this project unless the caller passes an explicit `project_id` (or `project_ids` list) override. The active project is forgotten when Claude Desktop quits.
 
     Validates that the project exists in the registry — pass an unknown id and the call returns `{"status": "not_found"}` without changing state.
     """
