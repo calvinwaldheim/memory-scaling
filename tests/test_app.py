@@ -111,6 +111,7 @@ from app import app as app_module  # noqa: E402
 from app.app import (  # noqa: E402
     archive_project,
     create_project,
+    find_user,
     forget,
     get_active_project,
     get_audit_log,
@@ -456,6 +457,100 @@ def test_list_access_returns_full_acl(monkeypatch) -> None:
     with _as_user("alice@example.com"):
         result = list_access(project_id="p")
     assert {r["user_name"] for r in result} == {"alice@example.com", "bob@example.com"}
+
+
+# ---------------------------------------------------------------------------
+# find_user (SCIM directory lookup)
+# ---------------------------------------------------------------------------
+
+
+def _scim_resource(user_name: str, display_name: str, active: bool = True) -> dict:
+    """SCIM /Users-shaped dict matching what Databricks returns."""
+    return {
+        "userName": user_name,
+        "displayName": display_name,
+        "active": active,
+    }
+
+
+def test_find_user_returns_matching_users(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_scim(query: str, limit: int):
+        captured["query"] = query
+        captured["limit"] = limit
+        return [
+            _scim_resource("alice@example.com", "Alice Jones"),
+            _scim_resource("alice.smith@example.com", "Alice Smith"),
+        ]
+
+    monkeypatch.setattr("app.app._scim_search_users", fake_scim)
+    with _as_user("caller@example.com"):
+        result = find_user(query="alice")
+    assert captured["query"] == "alice"
+    assert captured["limit"] == 10  # default
+    assert [r["user_name"] for r in result] == [
+        "alice@example.com",
+        "alice.smith@example.com",
+    ]
+    assert result[0]["display_name"] == "Alice Jones"
+    assert result[0]["active"] is True
+
+
+def test_find_user_clamps_limit(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_scim(query: str, limit: int):
+        captured["limit"] = limit
+        return []
+
+    monkeypatch.setattr("app.app._scim_search_users", fake_scim)
+    with _as_user("caller@example.com"):
+        find_user(query="x", limit=999)
+    assert captured["limit"] == 50  # upper clamp
+
+    with _as_user("caller@example.com"):
+        find_user(query="x", limit=0)
+    assert captured["limit"] == 1  # lower clamp
+
+
+def test_find_user_empty_query_short_circuits(monkeypatch) -> None:
+    called = {"n": 0}
+
+    def fake_scim(query: str, limit: int):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr("app.app._scim_search_users", fake_scim)
+    with _as_user("caller@example.com"):
+        assert find_user(query="") == []
+        assert find_user(query="   ") == []
+    assert called["n"] == 0  # never hit the network
+
+
+def test_find_user_falls_back_to_user_name_when_display_missing(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.app._scim_search_users",
+        lambda q, n: [{"userName": "bob@example.com", "active": True}],
+    )
+    with _as_user("caller@example.com"):
+        result = find_user(query="bob")
+    assert result == [
+        {"user_name": "bob@example.com", "display_name": "bob@example.com", "active": True}
+    ]
+
+
+def test_find_user_skips_resources_without_user_name(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.app._scim_search_users",
+        lambda q, n: [
+            {"displayName": "ghost"},  # no userName — skip
+            _scim_resource("real@example.com", "Real Person"),
+        ],
+    )
+    with _as_user("caller@example.com"):
+        result = find_user(query="x")
+    assert [r["user_name"] for r in result] == ["real@example.com"]
 
 
 # ---------------------------------------------------------------------------
