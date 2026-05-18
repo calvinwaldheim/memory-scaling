@@ -17,6 +17,7 @@ def retrieve(
     domain: str | None = None,
     min_quality_score: float | None = None,
     track_retrieval: bool = True,
+    include_inactive: bool = False,
 ) -> list[RetrievedMemory]:
     """Embed a question and retrieve the top-k similar memories.
 
@@ -30,6 +31,8 @@ def retrieve(
         track_retrieval: When True (default) bump ``retrieval_count`` on each returned row so
             consolidation/pruning can later prefer hot memories. Pass False from eval and
             verification scripts that should not perturb production usage signals.
+        include_inactive: When True, also surface rows that are superseded or soft-forgotten.
+            Default False keeps retrieval focused on the live believed-true subset.
 
     Returns:
         Retrieved memory rows sorted by ascending cosine distance.
@@ -45,6 +48,7 @@ def retrieve(
         memory_type=memory_type,
         domain=domain,
         min_quality_score=min_quality_score,
+        include_inactive=include_inactive,
     )
     if track_retrieval and memories:
         bump_retrieval_counts([m.id for m in memories if m.id])
@@ -77,12 +81,12 @@ def answer(
         project_id=project_id,
         project_type="product",
         memory_type="episodic",
-        scope="organizational",
         domain="interactions",
         rule=question[:100],
         context=content,
         source_ref=AGENT_SOURCE_REF,
         embedding=embed_text(content),
         quality_score=0.9,
+        created_by="agent",
     )
     return response

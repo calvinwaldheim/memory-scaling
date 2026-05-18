@@ -2,6 +2,8 @@
 ## Proof of Concept — Technical Report
 *May 2026 · Calvin Waldheim*
 
+> **Historical snapshot.** This report documents the original POC. The system has grown since then — a reusable [`memory_agent`](memory_agent/) Python package, an [MCP app](app/), multi-project support, and supersede/lineage as first-class concepts. Current architecture and usage live in [`README.md`](README.md); Claude-facing operating manual in [`AGENT.md`](AGENT.md). The findings, retrieval numbers, and design rationale below are preserved verbatim.
+
 ---
 
 ## 1. Overview

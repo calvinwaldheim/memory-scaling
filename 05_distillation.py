@@ -14,9 +14,20 @@
 # MAGIC in some semantic row's `derived_from` array, so re-running only processes
 # MAGIC episodic memories created since the last distillation pass.
 # MAGIC
+# MAGIC ### Supersede integration (migration 003)
+# MAGIC
+# MAGIC When `REDISTILL_ALL=True`, the fetch step drops the `NOT EXISTS` filter and
+# MAGIC pulls every episodic in the project. The write step then detects when a
+# MAGIC newly synthesized semantic strictly generalizes an existing live semantic
+# MAGIC (its `derived_from` is a superset of an existing semantic's) and calls
+# MAGIC `storage.supersede_memory` instead of inserting fresh. The old semantic is
+# MAGIC kept in the table for audit with `superseded_by` pointing at the new one,
+# MAGIC and default `recall` automatically filters it out.
+# MAGIC
 # MAGIC Schema reference (from `01_schema_setup`): `memories.id` is `UUID` with
 # MAGIC `DEFAULT gen_random_uuid()`; this notebook adds `derived_from UUID[]` on
-# MAGIC first run.
+# MAGIC first run. Migration 003 adds the `superseded_by` / `superseded_at` /
+# MAGIC `superseded_reason` / `superseded_by_user` columns plus the forget triad.
 
 # COMMAND ----------
 
@@ -80,6 +91,7 @@ print(f"Connecting to Lakebase as {runtime_user}")
 
 import hashlib
 import json
+import sys
 from collections import Counter
 
 import numpy as np
@@ -94,7 +106,6 @@ from sklearn.cluster import AgglomerativeClustering
 # project's episodic rows.
 PROJECT_ID = "memory-kb-poc"
 PROJECT_TYPE = "product"            # mirrors what 02_bootstrap and 04_agent write
-SEMANTIC_SCOPE = "organizational"   # semantic memories are cross-cutting by definition
 SEMANTIC_SOURCE_REF = "distilled-v1"
 SEMANTIC_QUALITY_SCORE = 0.85       # slightly higher than episodic (LLM-vetted generalization)
 
@@ -107,6 +118,15 @@ DISTANCE_THRESHOLD = 0.4    # was 0.25 — observed pairwise distances among rel
 MIN_CLUSTER_SIZE = 2        # singletons are skipped (nothing to generalize from)
 MAX_CHUNKS_PER_PROMPT = 10  # cap on episodic examples sent to the LLM per cluster
 SYNTHESIS_TEMPERATURE = 0.2
+
+# --- Supersede integration -------------------------------------------------
+# When True, FETCH_SQL drops the NOT EXISTS filter and pulls every episodic in
+# the project (not just the undistilled ones). Re-clustering then re-evaluates
+# existing semantics; any newly produced semantic that strictly generalizes a
+# live one (its derived_from is a superset of the live one's) supersedes it.
+# Default False keeps nightly runs cheap and append-only.
+REDISTILL_ALL = False
+SUPERSEDE_REASON = "distillation re-cluster produced a strict generalization"
 
 client = get_deploy_client("databricks")
 
@@ -141,7 +161,7 @@ print("derived_from column ready.")
 
 # COMMAND ----------
 
-FETCH_SQL = """
+FETCH_UNDISTILLED_SQL = """
 SELECT m.id,
        m.context,
        m.domain,
@@ -150,19 +170,39 @@ SELECT m.id,
 FROM memories m
 WHERE m.memory_type = 'episodic'
   AND m.project_id = %s
+  AND m.forgotten_at IS NULL
   AND NOT EXISTS (
         SELECT 1
         FROM memories s
         WHERE s.memory_type = 'semantic'
           AND s.project_id = m.project_id
+          AND s.superseded_at IS NULL
+          AND s.forgotten_at IS NULL
           AND m.id = ANY(s.derived_from)
       )
 ORDER BY m.created_at ASC;
 """
 
+# REDISTILL_ALL mode: pull every live episodic regardless of prior distillation
+# status. The write path will supersede stale semantics whose derived_from is a
+# subset of any newly-formed cluster.
+FETCH_ALL_SQL = """
+SELECT m.id,
+       m.context,
+       m.domain,
+       m.embedding::text AS embedding_text,
+       m.created_at
+FROM memories m
+WHERE m.memory_type = 'episodic'
+  AND m.project_id = %s
+  AND m.forgotten_at IS NULL
+ORDER BY m.created_at ASC;
+"""
+
+fetch_sql = FETCH_ALL_SQL if REDISTILL_ALL else FETCH_UNDISTILLED_SQL
 with psycopg2.connect(CONN_STRING, password=TOKEN) as conn, \
      conn.cursor(cursor_factory=RealDictCursor) as cur:
-    cur.execute(FETCH_SQL, (PROJECT_ID,))
+    cur.execute(fetch_sql, (PROJECT_ID,))
     rows = cur.fetchall()
 
 df = pd.DataFrame(rows)
@@ -365,55 +405,129 @@ for _, row in semantic_df.iterrows():
 # MAGIC %md
 # MAGIC ## 4. Write semantic memories back to Lakebase
 # MAGIC
-# MAGIC Column list mirrors `02_bootstrap` exactly, plus the new `derived_from`
-# MAGIC array. `embedding` goes in as `json.dumps(vec)` (pgvector accepts a
-# MAGIC JSON-formatted array as text input). `ON CONFLICT DO NOTHING` mirrors
-# MAGIC the bootstrap pattern.
+# MAGIC Two write paths:
+# MAGIC - **Fresh INSERT** when the new semantic's `derived_from` doesn't fully cover
+# MAGIC   any existing live semantic in this project (the default case for nightly
+# MAGIC   appends and the only path when `REDISTILL_ALL=False`).
+# MAGIC - **Supersede** when the new semantic's `derived_from` is a strict superset
+# MAGIC   of one existing live semantic's `derived_from`. The old semantic stays in
+# MAGIC   the table with `superseded_by` pointing at the new one. Default `recall`
+# MAGIC   excludes it; `get_lineage` can walk the chain.
+# MAGIC
+# MAGIC When a new semantic's `derived_from` is a strict superset of **multiple**
+# MAGIC live semantics, we fall back to fresh INSERT and log a warning — the v1
+# MAGIC supersede primitive is 1-to-1, and multi-target consolidation is something
+# MAGIC an operator should review (or a follow-up `supersede_many` primitive).
 
 # COMMAND ----------
 
 INSERT_SQL = """
 INSERT INTO memories
-    (project_id, project_type, memory_type, scope, domain,
+    (project_id, project_type, memory_type, domain,
      rule, context, source_ref, content_hash, embedding,
-     quality_score, derived_from)
+     quality_score, derived_from, created_by)
 VALUES %s
 ON CONFLICT DO NOTHING
 RETURNING id;
 """
 
-values = []
+# Pull every live semantic in the project with its derived_from set so we can
+# detect strict-superset overlap before deciding INSERT vs. supersede.
+LIVE_SEMANTICS_SQL = """
+SELECT id, derived_from
+FROM memories
+WHERE project_id = %s
+  AND memory_type = 'semantic'
+  AND superseded_at IS NULL
+  AND forgotten_at IS NULL
+  AND derived_from IS NOT NULL
+"""
+
+sys.path.insert(0, "/Workspace/Users/calvin.waldheim@gmail.com/memory-scaling")  # noqa: E402
+from memory_agent import storage as _storage  # noqa: E402
+
+with psycopg2.connect(CONN_STRING, password=TOKEN) as conn, conn.cursor() as cur:
+    cur.execute(LIVE_SEMANTICS_SQL, (PROJECT_ID,))
+    live_semantics = [(str(row[0]), {str(x) for x in (row[1] or [])}) for row in cur.fetchall()]
+
+
+def find_supersede_targets(new_derived_from: list[str], live: list[tuple[str, set]]) -> list[str]:
+    """Return ids of live semantics whose derived_from is a STRICT subset of the new one."""
+    new_set = set(new_derived_from)
+    return [old_id for old_id, old_set in live if old_set and old_set < new_set]
+
+
+supersede_results: list[dict] = []
+fresh_inserts: list[tuple] = []
+fresh_inserts_meta: list[dict] = []
+
 for _, row in semantic_df.iterrows():
     vec = embed(row["context"])
     content_hash = hashlib.md5(row["context"].encode()).hexdigest()
-    values.append((
-        PROJECT_ID,
-        PROJECT_TYPE,
-        "semantic",
-        SEMANTIC_SCOPE,
-        row["domain"],
-        row["context"][:100],       # first 100 chars as the "rule" summary
-        row["context"],
-        SEMANTIC_SOURCE_REF,
-        content_hash,
-        json.dumps(vec),            # pgvector accepts a JSON-formatted array as text input
-        SEMANTIC_QUALITY_SCORE,
-        row["derived_from"],        # list[str] of UUIDs → UUID[] via implicit cast
-    ))
+    new_derived_from = [str(x) for x in row["derived_from"]]
 
-if values:
+    targets = find_supersede_targets(new_derived_from, live_semantics)
+
+    if len(targets) == 1:
+        old_id = targets[0]
+        # supersede_memory uses its own _get_connection — relies on env vars
+        # LAKEBASE_URI and LAKEBASE_PROJECT_NAME (Notebook config or job env).
+        result = _storage.supersede_memory(
+            old_id=old_id,
+            new_content=row["context"],
+            embedding=vec,
+            reason=SUPERSEDE_REASON,
+            user_id="distillation",
+            rule=row["context"][:100],
+            quality_score=SEMANTIC_QUALITY_SCORE,
+            source_ref=SEMANTIC_SOURCE_REF,
+            memory_type="semantic",
+            domain=row["domain"],
+            derived_from=new_derived_from,
+        )
+        supersede_results.append({"cluster_id": int(row["cluster_id"]), "old_id": old_id, **result})
+        if result["status"] == "superseded":
+            print(f"Cluster {row['cluster_id']} → SUPERSEDE  old={old_id[:8]}…  new={result['new_id'][:8]}…")
+        else:
+            print(f"Cluster {row['cluster_id']} → supersede {result['status']!r}, will not retry as INSERT")
+    elif len(targets) >= 2:
+        print(
+            f"Cluster {row['cluster_id']} matches {len(targets)} live semantics "
+            f"(strict-superset overlap with {[t[:8] for t in targets]}). "
+            "Falling back to fresh INSERT — operator should review."
+        )
+        fresh_inserts.append((
+            PROJECT_ID, PROJECT_TYPE, "semantic", row["domain"],
+            row["context"][:100], row["context"], SEMANTIC_SOURCE_REF, content_hash,
+            json.dumps(vec), SEMANTIC_QUALITY_SCORE, new_derived_from, "distillation",
+        ))
+        fresh_inserts_meta.append({"cluster_id": int(row["cluster_id"]), "multi_target": targets})
+    else:
+        fresh_inserts.append((
+            PROJECT_ID, PROJECT_TYPE, "semantic", row["domain"],
+            row["context"][:100], row["context"], SEMANTIC_SOURCE_REF, content_hash,
+            json.dumps(vec), SEMANTIC_QUALITY_SCORE, new_derived_from, "distillation",
+        ))
+        fresh_inserts_meta.append({"cluster_id": int(row["cluster_id"])})
+
+new_ids: list = []
+if fresh_inserts:
     with psycopg2.connect(CONN_STRING, password=TOKEN) as conn, conn.cursor() as cur:
         execute_values(
             cur,
             INSERT_SQL,
-            values,
-            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::uuid[])",
+            fresh_inserts,
+            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::uuid[], %s)",
         )
         new_ids = [r[0] for r in cur.fetchall()]
         conn.commit()
-    print(f"Wrote {len(new_ids)} semantic memories. IDs: {new_ids}")
-else:
-    print("Nothing to write.")
+
+print(
+    f"\nDistillation write summary:\n"
+    f"  Fresh inserts:        {len(new_ids)} (cluster ids: {[m['cluster_id'] for m in fresh_inserts_meta]})\n"
+    f"  Superseded:           {sum(1 for r in supersede_results if r['status'] == 'superseded')}\n"
+    f"  Supersede no-ops:     {sum(1 for r in supersede_results if r['status'] != 'superseded')}"
+)
 
 # COMMAND ----------
 
