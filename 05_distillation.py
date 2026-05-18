@@ -106,7 +106,6 @@ from sklearn.cluster import AgglomerativeClustering
 # project's episodic rows.
 PROJECT_ID = "memory-kb-poc"
 PROJECT_TYPE = "product"            # mirrors what 02_bootstrap and 04_agent write
-SEMANTIC_SCOPE = "organizational"   # semantic memories are cross-cutting by definition
 SEMANTIC_SOURCE_REF = "distilled-v1"
 SEMANTIC_QUALITY_SCORE = 0.85       # slightly higher than episodic (LLM-vetted generalization)
 
@@ -424,9 +423,9 @@ for _, row in semantic_df.iterrows():
 
 INSERT_SQL = """
 INSERT INTO memories
-    (project_id, project_type, memory_type, scope, domain,
+    (project_id, project_type, memory_type, domain,
      rule, context, source_ref, content_hash, embedding,
-     quality_score, derived_from)
+     quality_score, derived_from, created_by)
 VALUES %s
 ON CONFLICT DO NOTHING
 RETURNING id;
@@ -483,7 +482,6 @@ for _, row in semantic_df.iterrows():
             quality_score=SEMANTIC_QUALITY_SCORE,
             source_ref=SEMANTIC_SOURCE_REF,
             memory_type="semantic",
-            scope=SEMANTIC_SCOPE,
             domain=row["domain"],
             derived_from=new_derived_from,
         )
@@ -499,16 +497,16 @@ for _, row in semantic_df.iterrows():
             "Falling back to fresh INSERT — operator should review."
         )
         fresh_inserts.append((
-            PROJECT_ID, PROJECT_TYPE, "semantic", SEMANTIC_SCOPE, row["domain"],
+            PROJECT_ID, PROJECT_TYPE, "semantic", row["domain"],
             row["context"][:100], row["context"], SEMANTIC_SOURCE_REF, content_hash,
-            json.dumps(vec), SEMANTIC_QUALITY_SCORE, new_derived_from,
+            json.dumps(vec), SEMANTIC_QUALITY_SCORE, new_derived_from, "distillation",
         ))
         fresh_inserts_meta.append({"cluster_id": int(row["cluster_id"]), "multi_target": targets})
     else:
         fresh_inserts.append((
-            PROJECT_ID, PROJECT_TYPE, "semantic", SEMANTIC_SCOPE, row["domain"],
+            PROJECT_ID, PROJECT_TYPE, "semantic", row["domain"],
             row["context"][:100], row["context"], SEMANTIC_SOURCE_REF, content_hash,
-            json.dumps(vec), SEMANTIC_QUALITY_SCORE, new_derived_from,
+            json.dumps(vec), SEMANTIC_QUALITY_SCORE, new_derived_from, "distillation",
         ))
         fresh_inserts_meta.append({"cluster_id": int(row["cluster_id"])})
 
@@ -519,7 +517,7 @@ if fresh_inserts:
             cur,
             INSERT_SQL,
             fresh_inserts,
-            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::uuid[])",
+            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::uuid[], %s)",
         )
         new_ids = [r[0] for r in cur.fetchall()]
         conn.commit()

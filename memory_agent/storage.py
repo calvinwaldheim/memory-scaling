@@ -25,16 +25,17 @@ from .config import (
 
 INSERT_MEMORY_SQL = """
 INSERT INTO memories
-    (project_id, project_type, memory_type, scope, domain, rule, context, source_ref, content_hash, embedding, quality_score)
+    (project_id, project_type, memory_type, domain, rule, context, source_ref, content_hash, embedding, quality_score, created_by)
 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT DO NOTHING
+RETURNING id
 """
 
 RETRIEVE_MEMORIES_SQL = """
 SELECT rule, context, quality_score,
        embedding <=> %(emb)s::vector AS distance,
        source_ref, memory_type, domain, id, project_id,
-       superseded_at, superseded_by, forgotten_at
+       superseded_at, superseded_by, forgotten_at, created_by
 FROM memories
 WHERE project_id = ANY(%(project_ids)s::text[])
   AND (%(memory_type)s::text IS NULL OR memory_type = %(memory_type)s)
@@ -54,7 +55,7 @@ WHERE id = ANY(%(ids)s::uuid[])
 DELETE_MEMORY_SQL = """
 DELETE FROM memories
 WHERE id = %(id)s::uuid
-RETURNING id, rule, context, memory_type, domain, scope, quality_score
+RETURNING id, project_id, rule, context, memory_type, domain, quality_score
 """
 
 # Soft-forget: mark a memory as retracted without removing the row. Audit fields
@@ -69,7 +70,7 @@ SET forgotten_at = NOW(),
     updated_at = NOW()
 WHERE id = %(id)s::uuid
   AND forgotten_at IS NULL
-RETURNING id, rule, context, memory_type, domain, scope, quality_score,
+RETURNING id, project_id, rule, context, memory_type, domain, quality_score,
           forgotten_at, forgotten_reason, forgotten_by_user
 """
 
@@ -83,7 +84,7 @@ WHERE id = %(id)s::uuid
 
 # Row-lock the old memory before we decide whether to supersede it.
 LOCK_MEMORY_FOR_SUPERSEDE_SQL = """
-SELECT id, project_id, project_type, memory_type, scope, user_id, domain,
+SELECT id, project_id, project_type, memory_type, domain,
        rule, superseded_at, superseded_by, forgotten_at
 FROM memories
 WHERE id = %(id)s::uuid
@@ -97,11 +98,11 @@ FOR UPDATE
 # supersedes a previous semantic for the same cluster.
 INSERT_SUPERSEDE_MEMORY_SQL = """
 INSERT INTO memories
-    (project_id, project_type, memory_type, scope, user_id, domain, rule,
+    (project_id, project_type, memory_type, domain, rule, created_by,
      context, source_ref, content_hash, embedding, quality_score, derived_from)
 VALUES
-    (%(project_id)s, %(project_type)s, %(memory_type)s, %(scope)s, %(user_id)s,
-     %(domain)s, %(rule)s, %(context)s, %(source_ref)s, %(content_hash)s,
+    (%(project_id)s, %(project_type)s, %(memory_type)s, %(domain)s,
+     %(rule)s, %(created_by)s, %(context)s, %(source_ref)s, %(content_hash)s,
      %(embedding)s, %(quality_score)s, %(derived_from)s::uuid[])
 ON CONFLICT (project_id, content_hash) DO NOTHING
 RETURNING id
@@ -123,20 +124,20 @@ RETURNING id, superseded_at
 LINEAGE_FORWARD_SQL = """
 WITH RECURSIVE chain AS (
     SELECT id, superseded_by, superseded_at, superseded_reason, superseded_by_user,
-           forgotten_at, rule, context, memory_type, domain, scope, quality_score,
+           forgotten_at, rule, context, memory_type, domain, quality_score,
            created_at, 0 AS depth
     FROM memories
     WHERE id = %(id)s::uuid
   UNION ALL
     SELECT m.id, m.superseded_by, m.superseded_at, m.superseded_reason, m.superseded_by_user,
-           m.forgotten_at, m.rule, m.context, m.memory_type, m.domain, m.scope, m.quality_score,
+           m.forgotten_at, m.rule, m.context, m.memory_type, m.domain, m.quality_score,
            m.created_at, chain.depth + 1
     FROM memories m
     JOIN chain ON m.id = chain.superseded_by
     WHERE chain.depth < 64
 )
 SELECT id, superseded_by, superseded_at, superseded_reason, superseded_by_user,
-       forgotten_at, rule, context, memory_type, domain, scope, quality_score,
+       forgotten_at, rule, context, memory_type, domain, quality_score,
        created_at, depth
 FROM chain
 ORDER BY depth ASC
@@ -147,20 +148,20 @@ ORDER BY depth ASC
 LINEAGE_BACKWARD_SQL = """
 WITH RECURSIVE ancestors AS (
     SELECT id, superseded_by, superseded_at, superseded_reason, superseded_by_user,
-           forgotten_at, rule, context, memory_type, domain, scope, quality_score,
+           forgotten_at, rule, context, memory_type, domain, quality_score,
            created_at, 1 AS depth
     FROM memories
     WHERE superseded_by = %(id)s::uuid
   UNION ALL
     SELECT m.id, m.superseded_by, m.superseded_at, m.superseded_reason, m.superseded_by_user,
-           m.forgotten_at, m.rule, m.context, m.memory_type, m.domain, m.scope, m.quality_score,
+           m.forgotten_at, m.rule, m.context, m.memory_type, m.domain, m.quality_score,
            m.created_at, ancestors.depth + 1
     FROM memories m
     JOIN ancestors ON m.superseded_by = ancestors.id
     WHERE ancestors.depth < 64
 )
 SELECT id, superseded_by, superseded_at, superseded_reason, superseded_by_user,
-       forgotten_at, rule, context, memory_type, domain, scope, quality_score,
+       forgotten_at, rule, context, memory_type, domain, quality_score,
        created_at, depth
 FROM ancestors
 ORDER BY depth ASC
@@ -169,10 +170,77 @@ ORDER BY depth ASC
 # Fields that update_memory_fields() is allowed to overwrite. `context` is
 # intentionally excluded because changing it would invalidate the stored
 # embedding and content_hash — model that as supersede instead.
-UPDATABLE_FIELDS = ("rule", "domain", "quality_score", "memory_type", "scope")
+UPDATABLE_FIELDS = ("rule", "domain", "quality_score", "memory_type")
 
 PROJECT_TYPES = ("data_domain", "engineering", "compliance", "customer", "product")
 PROJECT_ID_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+# --- Project ACL ----------------------------------------------------------
+# Migration 004 introduces project_acl. Sharing is the access boundary: if a
+# project isn't shared with a user, the user can't see it. There are no
+# row-level scope flags.
+
+ROLES = ("viewer", "contributor", "owner")
+ROLE_RANK = {"viewer": 1, "contributor": 2, "owner": 3}
+
+GRANT_ACCESS_SQL = """
+INSERT INTO project_acl (project_id, user_name, role, granted_by)
+VALUES (%(project_id)s, %(user_name)s, %(role)s, %(granted_by)s)
+ON CONFLICT (project_id, user_name) DO UPDATE
+    SET role = EXCLUDED.role,
+        granted_at = NOW(),
+        granted_by = EXCLUDED.granted_by
+RETURNING project_id, user_name, role, granted_at, granted_by
+"""
+
+REVOKE_ACCESS_SQL = """
+DELETE FROM project_acl
+WHERE project_id = %(project_id)s AND user_name = %(user_name)s
+RETURNING project_id, user_name, role
+"""
+
+LIST_ACCESS_SQL = """
+SELECT project_id, user_name, role, granted_at, granted_by
+FROM project_acl
+WHERE project_id = %(project_id)s
+ORDER BY role DESC, user_name ASC
+"""
+
+GET_USER_ROLE_SQL = """
+SELECT role FROM project_acl
+WHERE project_id = %(project_id)s AND user_name = %(user_name)s
+"""
+
+ACCESSIBLE_PROJECTS_SQL = """
+SELECT project_id FROM project_acl
+WHERE user_name = %(user_name)s
+"""
+
+# --- Memory audit log -----------------------------------------------------
+# Migration 005 introduces memory_audit_log. Every mutation (create / supersede
+# / soft-forget / hard-purge / update) writes one row inside the same
+# transaction as the data change. Audit can never drift from reality.
+
+INSERT_AUDIT_LOG_SQL = """
+INSERT INTO memory_audit_log
+    (memory_id, project_id, action, actor, reason, before_state, after_state)
+VALUES
+    (%(memory_id)s::uuid, %(project_id)s, %(action)s, %(actor)s,
+     %(reason)s, %(before_state)s::jsonb, %(after_state)s::jsonb)
+"""
+
+GET_AUDIT_LOG_SQL = """
+SELECT id, memory_id, project_id, action, actor, reason,
+       before_state, after_state, created_at
+FROM memory_audit_log
+WHERE memory_id = %(memory_id)s::uuid
+ORDER BY created_at DESC
+LIMIT %(limit)s
+"""
+
+GET_MEMORY_PROJECT_SQL = """
+SELECT project_id FROM memories WHERE id = %(id)s::uuid
+"""
 
 CREATE_PROJECT_SQL = """
 INSERT INTO projects (project_id, name, project_type, description, tags, created_by)
@@ -275,6 +343,33 @@ class RetrievedMemory:
     superseded_at: str | None = None
     superseded_by: str | None = None
     forgotten_at: str | None = None
+    created_by: str | None = None
+
+
+@dataclass(frozen=True)
+class ProjectAccess:
+    """One row from project_acl — a user's role on a project."""
+
+    project_id: str
+    user_name: str
+    role: str
+    granted_at: str | None
+    granted_by: str | None
+
+
+@dataclass(frozen=True)
+class AuditLogEntry:
+    """One row from memory_audit_log — a single mutation event."""
+
+    id: str
+    memory_id: str
+    project_id: str
+    action: str
+    actor: str
+    reason: str | None
+    before_state: dict | None
+    after_state: dict | None
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -286,7 +381,6 @@ class LineageNode:
     context: str
     memory_type: str | None
     domain: str | None
-    scope: str | None
     quality_score: float | None
     superseded_by: str | None
     superseded_at: str | None
@@ -379,27 +473,28 @@ def insert_memory(
     project_id: str,
     project_type: str,
     memory_type: str,
-    scope: str,
     domain: str | None,
     rule: str | None,
     context: str,
     source_ref: str,
     embedding: Sequence[float],
     quality_score: float,
+    created_by: str | None = None,
 ) -> InsertMemoryResult:
-    """Insert one memory row using the hardened schema defaults.
+    """Insert one memory row and append a 'created' audit entry in the same transaction.
 
     Args:
         project_id: Project identifier stored in the memories table.
         project_type: Project type value stored with the memory.
         memory_type: Memory type such as episodic or semantic.
-        scope: Scope value stored with the memory.
         domain: Domain value stored with the memory.
         rule: Rule summary stored with the memory.
         context: Full memory content.
         source_ref: Source identifier for the inserted memory.
         embedding: Embedding vector serialized for pgvector.
         quality_score: Quality score stored with the memory.
+        created_by: Verified user identifier (from the MCP token verifier). Stored on
+            the row as the audit field and recorded as `actor` on the audit log entry.
 
     Returns:
         Insert metadata including duplicate detection status and content hash.
@@ -417,7 +512,6 @@ def insert_memory(
                 project_id,
                 project_type,
                 memory_type,
-                scope,
                 domain,
                 rule,
                 context,
@@ -425,14 +519,66 @@ def insert_memory(
                 content_hash,
                 json.dumps(list(embedding)),
                 quality_score,
+                created_by,
             ),
         )
+        new_row = cur.fetchone()
+        if new_row is not None:
+            new_id = str(new_row[0])
+            _audit(
+                cur,
+                memory_id=new_id,
+                project_id=project_id,
+                action="created",
+                actor=created_by or "system",
+                reason=None,
+                before=None,
+                after={
+                    "rule": rule,
+                    "memory_type": memory_type,
+                    "domain": domain,
+                    "source_ref": source_ref,
+                    "quality_score": quality_score,
+                },
+            )
+            status = "stored"
+        else:
+            status = "duplicate"
         conn.commit()
-        status = "stored" if cur.rowcount == 1 else "duplicate"
         return InsertMemoryResult(status=status, content_hash=content_hash)
     finally:
         cur.close()
         conn.close()
+
+
+def _audit(
+    cur,
+    *,
+    memory_id: str,
+    project_id: str,
+    action: str,
+    actor: str,
+    reason: str | None,
+    before: dict | None,
+    after: dict | None,
+) -> None:
+    """Append one row to memory_audit_log on the given open cursor.
+
+    Must be called from within an open transaction — the audit insert commits
+    or rolls back together with the data change it describes.
+    """
+    cur.execute(
+        INSERT_AUDIT_LOG_SQL,
+        {
+            "memory_id": memory_id,
+            "project_id": project_id,
+            "action": action,
+            "actor": actor,
+            "reason": reason,
+            "before_state": json.dumps(before) if before is not None else None,
+            "after_state": json.dumps(after) if after is not None else None,
+        },
+    )
 
 
 def store_bootstrap_memories(
@@ -467,7 +613,6 @@ def store_bootstrap_memories(
                     project_id,
                     "product",
                     "episodic",
-                    "organizational",
                     "architecture",
                     chunk[:100],
                     chunk,
@@ -475,8 +620,13 @@ def store_bootstrap_memories(
                     content_hash,
                     json.dumps(list(embedding)),
                     0.8,
+                    "bootstrap",
                 ),
             )
+            # We intentionally skip audit-log writes here. Bootstrap is a bulk
+            # seed of episodic chunks from a source document; one audit row per
+            # chunk would bloat the log without adding investigative value.
+            # Audit captures user-driven mutations, not initial ingestion.
             stored += 1
         conn.commit()
     finally:
@@ -559,6 +709,7 @@ def retrieve_memories(
             superseded_at=row[9].isoformat() if isinstance(row[9], datetime) else row[9],
             superseded_by=str(row[10]) if row[10] is not None else None,
             forgotten_at=row[11].isoformat() if isinstance(row[11], datetime) else row[11],
+            created_by=row[12],
         )
         for row in rows
     ]
@@ -590,19 +741,24 @@ def bump_retrieval_counts(memory_ids: Sequence[str]) -> int:
     return updated
 
 
-def delete_memory(memory_id: str) -> dict | None:
-    """Hard-delete one memory row by id (audit-destroying).
+def delete_memory(memory_id: str, actor: str = "system", reason: str | None = None) -> dict | None:
+    """Hard-delete one memory row by id and append a 'purged' audit entry.
 
     Reserved for the ``hard=True`` opt-in path on ``forget`` and the future
     pruning job that reclaims rows past their retention window. Prefer
-    ``soft_forget_memory`` for routine retraction — it keeps the audit trail.
+    ``soft_forget_memory`` for routine retraction — it keeps the row in place.
+    Note the audit log entry survives even after the row is gone, so the
+    erasure is still traceable.
 
     Args:
         memory_id: UUID string of the row to remove.
+        actor: Verified user identifier (from the MCP token verifier). Recorded
+            as ``actor`` on the audit log entry.
+        reason: Free-text rationale for the hard delete.
 
     Returns:
-        A dict describing the deleted row (``id``, ``rule``, ``context``, ``memory_type``,
-        ``domain``, ``scope``, ``quality_score``) or ``None`` if no row matched.
+        A dict describing the deleted row (``id``, ``rule``, ``context``,
+        ``memory_type``, ``domain``, ``quality_score``) or ``None`` if no row matched.
 
     Raises:
         psycopg2.Error: If the database connection or delete fails.
@@ -612,6 +768,23 @@ def delete_memory(memory_id: str) -> dict | None:
         with conn.cursor() as cur:
             cur.execute(DELETE_MEMORY_SQL, {"id": memory_id})
             row = cur.fetchone()
+            if row is not None:
+                _audit(
+                    cur,
+                    memory_id=str(row[0]),
+                    project_id=row[1],
+                    action="purged",
+                    actor=actor,
+                    reason=reason,
+                    before={
+                        "rule": row[2],
+                        "context": row[3],
+                        "memory_type": row[4],
+                        "domain": row[5],
+                        "quality_score": row[6],
+                    },
+                    after=None,
+                )
         conn.commit()
     finally:
         conn.close()
@@ -619,11 +792,11 @@ def delete_memory(memory_id: str) -> dict | None:
         return None
     return {
         "id": str(row[0]),
-        "rule": row[1],
-        "context": row[2],
-        "memory_type": row[3],
-        "domain": row[4],
-        "scope": row[5],
+        "project_id": row[1],
+        "rule": row[2],
+        "context": row[3],
+        "memory_type": row[4],
+        "domain": row[5],
         "quality_score": row[6],
     }
 
@@ -661,18 +834,36 @@ def soft_forget_memory(
             )
             row = cur.fetchone()
             if row is not None:
-                conn.commit()
                 forgotten_at = row[7]
                 if isinstance(forgotten_at, datetime):
                     forgotten_at = forgotten_at.isoformat()
+                _audit(
+                    cur,
+                    memory_id=str(row[0]),
+                    project_id=row[1],
+                    action="forgotten",
+                    actor=user_id or "system",
+                    reason=reason,
+                    before={
+                        "rule": row[2],
+                        "memory_type": row[3],
+                        "domain": row[4],
+                    },
+                    after={
+                        "forgotten_at": forgotten_at,
+                        "forgotten_reason": row[8],
+                        "forgotten_by_user": row[9],
+                    },
+                )
+                conn.commit()
                 return {
                     "status": "forgotten",
                     "id": str(row[0]),
-                    "rule": row[1],
-                    "context": row[2],
-                    "memory_type": row[3],
-                    "domain": row[4],
-                    "scope": row[5],
+                    "project_id": row[1],
+                    "rule": row[2],
+                    "context": row[3],
+                    "memory_type": row[4],
+                    "domain": row[5],
                     "quality_score": row[6],
                     "forgotten_at": forgotten_at,
                     "forgotten_reason": row[8],
@@ -728,16 +919,18 @@ def supersede_memory(
     quality_score: float | None = None,
     source_ref: str | None = None,
     memory_type: str | None = None,
-    scope: str | None = None,
     domain: str | None = None,
     derived_from: Sequence[str] | None = None,
 ) -> dict:
     """Atomically replace one memory with a corrected version, preserving lineage.
 
-    The replacement memory inherits ``project_id``, ``project_type``, ``user_id``,
-    ``memory_type``, ``scope``, and ``domain`` from the old row unless explicitly
-    overridden. The ``superseded_by`` FK on the old row is patched to point at
-    the new row in the same transaction, so retrieval never sees an interim state.
+    The replacement memory inherits ``project_id``, ``project_type``, ``memory_type``,
+    and ``domain`` from the old row unless explicitly overridden. ``created_by`` on
+    the new row is set to ``user_id`` (the verified actor). The ``superseded_by`` FK
+    on the old row is patched to point at the new row in the same transaction, so
+    retrieval never sees an interim state. Two audit-log entries (a ``created`` row
+    for the new memory, a ``superseded`` row for the old) are appended inside the
+    same transaction.
 
     Args:
         old_id: UUID string of the memory being corrected.
@@ -746,9 +939,10 @@ def supersede_memory(
             the embedding model so storage stays embedding-model-agnostic.
         reason: Free-text rationale (required — supersedence without a reason is
             indistinguishable from churn in audit reports).
-        user_id: Attribution string for the actor who superseded.
-        rule, quality_score, source_ref, memory_type, scope, domain: Optional
-            per-field overrides on the new row. Unset fields inherit from the old row.
+        user_id: Verified user identifier; stored as ``created_by`` on the new row
+            and as ``actor`` on both audit-log entries.
+        rule, quality_score, source_ref, memory_type, domain: Optional per-field
+            overrides on the new row. Unset fields inherit from the old row.
 
     Returns:
         A dict with ``status`` and supporting fields. Possible statuses:
@@ -781,8 +975,6 @@ def supersede_memory(
                 old_project_id,
                 old_project_type,
                 old_memory_type,
-                old_scope,
-                old_user_id,
                 old_domain,
                 old_rule,
                 old_superseded_at,
@@ -809,8 +1001,7 @@ def supersede_memory(
                     "project_id": old_project_id,
                     "project_type": old_project_type,
                     "memory_type": memory_type if memory_type is not None else old_memory_type,
-                    "scope": scope if scope is not None else old_scope,
-                    "user_id": old_user_id,
+                    "created_by": user_id,
                     "domain": domain if domain is not None else old_domain,
                     "rule": rule if rule is not None else old_rule,
                     "context": new_content,
@@ -847,6 +1038,38 @@ def supersede_memory(
             superseded_at = marked[1]
             if isinstance(superseded_at, datetime):
                 superseded_at = superseded_at.isoformat()
+
+            # Audit: one 'created' row for the new memory, one 'superseded' row
+            # for the old. Both inside the same transaction as the mutations.
+            actor = user_id or "system"
+            _audit(
+                cur,
+                memory_id=new_id,
+                project_id=old_project_id,
+                action="created",
+                actor=actor,
+                reason=f"supersedes {old_id}",
+                before=None,
+                after={
+                    "rule": rule if rule is not None else old_rule,
+                    "memory_type": memory_type if memory_type is not None else old_memory_type,
+                    "domain": domain if domain is not None else old_domain,
+                    "supersedes": old_id,
+                },
+            )
+            _audit(
+                cur,
+                memory_id=old_id,
+                project_id=old_project_id,
+                action="superseded",
+                actor=actor,
+                reason=reason,
+                before={"rule": old_rule, "memory_type": old_memory_type, "domain": old_domain},
+                after={
+                    "superseded_by": new_id,
+                    "superseded_at": superseded_at,
+                },
+            )
         conn.commit()
     finally:
         conn.close()
@@ -867,7 +1090,7 @@ def _lineage_row_to_node(row: tuple) -> LineageNode:
     forgotten_at = row[5]
     if isinstance(forgotten_at, datetime):
         forgotten_at = forgotten_at.isoformat()
-    created_at = row[12]
+    created_at = row[11]
     if isinstance(created_at, datetime):
         created_at = created_at.isoformat()
     return LineageNode(
@@ -881,10 +1104,9 @@ def _lineage_row_to_node(row: tuple) -> LineageNode:
         context=row[7],
         memory_type=row[8],
         domain=row[9],
-        scope=row[10],
-        quality_score=row[11],
+        quality_score=row[10],
         created_at=created_at,
-        depth=int(row[13]),
+        depth=int(row[12]),
     )
 
 
@@ -916,22 +1138,27 @@ def get_lineage(memory_id: str) -> Lineage | None:
     )
 
 
-def update_memory_fields(memory_id: str, **fields: object) -> dict | None:
-    """Update one memory row's lightweight fields by id.
+def update_memory_fields(
+    memory_id: str,
+    *,
+    actor: str = "system",
+    **fields: object,
+) -> dict | None:
+    """Update one memory row's lightweight fields by id and append an 'updated' audit entry.
 
     Only the fields listed in ``UPDATABLE_FIELDS`` may be changed; passing any
     other key raises ``ValueError``. ``context`` is intentionally not updatable
     because changing it would invalidate the stored embedding and content_hash —
-    callers should ``delete_memory`` + re-insert instead.
+    callers should ``supersede_memory`` instead.
 
     Args:
         memory_id: UUID string of the row to update.
+        actor: Verified user identifier; recorded as ``actor`` on the audit log entry.
         **fields: New values for one or more of ``rule``, ``domain``, ``quality_score``,
-            ``memory_type``, ``scope``. Pass ``None`` as a value to set the column to NULL.
+            ``memory_type``. Pass ``None`` as a value to set the column to NULL.
 
     Returns:
-        A dict describing the updated row (same shape as ``delete_memory``'s return value)
-        or ``None`` if no row matched.
+        A dict describing the updated row or ``None`` if no row matched.
 
     Raises:
         ValueError: If no updatable fields were provided or unknown keys were passed.
@@ -951,7 +1178,7 @@ def update_memory_fields(memory_id: str, **fields: object) -> dict | None:
     query = (
         f"UPDATE memories SET {set_clause}, updated_at = NOW() "
         "WHERE id = %(id)s::uuid "
-        "RETURNING id, rule, context, memory_type, domain, scope, quality_score"
+        "RETURNING id, project_id, rule, context, memory_type, domain, quality_score"
     )
     params = {**fields, "id": memory_id}
 
@@ -960,6 +1187,17 @@ def update_memory_fields(memory_id: str, **fields: object) -> dict | None:
         with conn.cursor() as cur:
             cur.execute(query, params)
             row = cur.fetchone()
+            if row is not None:
+                _audit(
+                    cur,
+                    memory_id=str(row[0]),
+                    project_id=row[1],
+                    action="updated",
+                    actor=actor,
+                    reason=None,
+                    before=None,
+                    after={k: v for k, v in fields.items()},
+                )
         conn.commit()
     finally:
         conn.close()
@@ -967,11 +1205,11 @@ def update_memory_fields(memory_id: str, **fields: object) -> dict | None:
         return None
     return {
         "id": str(row[0]),
-        "rule": row[1],
-        "context": row[2],
-        "memory_type": row[3],
-        "domain": row[4],
-        "scope": row[5],
+        "project_id": row[1],
+        "rule": row[2],
+        "context": row[3],
+        "memory_type": row[4],
+        "domain": row[5],
         "quality_score": row[6],
     }
 
@@ -1184,3 +1422,155 @@ def archive_project(project_id: str) -> Project | None:
         archived_at=archived_at,
         memory_count=None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Project ACL
+# ---------------------------------------------------------------------------
+
+
+def grant_project_access(
+    project_id: str, user_name: str, role: str, granted_by: str
+) -> ProjectAccess:
+    """Grant or upgrade a user's role on a project. Idempotent — re-grants are upserts.
+
+    Raises:
+        ValueError: If ``role`` is not one of ROLES.
+        psycopg2.Error: If the project doesn't exist (FK violation) or the upsert fails.
+    """
+    if role not in ROLES:
+        raise ValueError(f"role {role!r} must be one of {list(ROLES)}")
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                GRANT_ACCESS_SQL,
+                {
+                    "project_id": project_id,
+                    "user_name": user_name,
+                    "role": role,
+                    "granted_by": granted_by,
+                },
+            )
+            row = cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    granted_at = row[3]
+    if isinstance(granted_at, datetime):
+        granted_at = granted_at.isoformat()
+    return ProjectAccess(
+        project_id=row[0],
+        user_name=row[1],
+        role=row[2],
+        granted_at=granted_at,
+        granted_by=row[4],
+    )
+
+
+def revoke_project_access(project_id: str, user_name: str) -> ProjectAccess | None:
+    """Revoke a user's access to a project. Returns the removed row or None if no match."""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(REVOKE_ACCESS_SQL, {"project_id": project_id, "user_name": user_name})
+            row = cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return ProjectAccess(
+        project_id=row[0], user_name=row[1], role=row[2], granted_at=None, granted_by=None
+    )
+
+
+def list_project_access(project_id: str) -> list[ProjectAccess]:
+    """Return every (user, role) pair for a project, owners first then alphabetically."""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(LIST_ACCESS_SQL, {"project_id": project_id})
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        granted_at = row[3]
+        if isinstance(granted_at, datetime):
+            granted_at = granted_at.isoformat()
+        out.append(ProjectAccess(
+            project_id=row[0], user_name=row[1], role=row[2],
+            granted_at=granted_at, granted_by=row[4],
+        ))
+    return out
+
+
+def get_user_role(project_id: str, user_name: str) -> str | None:
+    """Return the user's role on the project, or None if not granted."""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(GET_USER_ROLE_SQL, {"project_id": project_id, "user_name": user_name})
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    return row[0] if row is not None else None
+
+
+def accessible_projects_for(user_name: str) -> set[str]:
+    """Return the set of project_ids the user has any role on. Empty set if none."""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(ACCESSIBLE_PROJECTS_SQL, {"user_name": user_name})
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {row[0] for row in rows}
+
+
+# ---------------------------------------------------------------------------
+# Audit log
+# ---------------------------------------------------------------------------
+
+
+def get_memory_project(memory_id: str) -> str | None:
+    """Return the project_id of a memory by id, or None if not found. Used by
+    the audit-log read path to authorize the caller before returning the log."""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(GET_MEMORY_PROJECT_SQL, {"id": memory_id})
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    return row[0] if row is not None else None
+
+
+def get_memory_audit_log(memory_id: str, limit: int = 50) -> list[AuditLogEntry]:
+    """Return the audit history for one memory, newest first."""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(GET_AUDIT_LOG_SQL, {"memory_id": memory_id, "limit": limit})
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        created_at = row[8]
+        if isinstance(created_at, datetime):
+            created_at = created_at.isoformat()
+        out.append(AuditLogEntry(
+            id=str(row[0]),
+            memory_id=str(row[1]),
+            project_id=row[2],
+            action=row[3],
+            actor=row[4],
+            reason=row[5],
+            before_state=row[6],
+            after_state=row[7],
+            created_at=created_at,
+        ))
+    return out

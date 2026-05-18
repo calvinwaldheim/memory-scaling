@@ -76,6 +76,24 @@ Soft-forget is the parallel for retractions without a replacement. The row stays
 
 Both behaviors land in migration 003 ([`migrations/003_supersede_lineage.sql`](migrations/003_supersede_lineage.sql)).
 
+### Security model
+
+Three layers, each enforced server-side:
+
+**1. Authentication.** The MCP server runs a `DatabricksTokenVerifier` that calls `/api/2.0/preview/scim/v2/Me` on every request and extracts the verified user identity. There is no anonymous mode in production transports — a request without a valid Databricks workspace token is rejected.
+
+**2. Per-project authorization.** The `project_acl` table maps `(project_id, user_name) → role`, with three roles: `viewer`, `contributor`, `owner`. Every tool checks the caller's role at the top of the call. Privacy is project-level: **a project is private by default**, only the creator has access until they explicitly `grant_access` to others. There's no row-level "personal" flag.
+
+| Action | Required role |
+|---|---|
+| `recall`, `stats`, `list_hot`, `get_lineage`, `get_audit_log`, `list_access` | viewer |
+| `remember`, `supersede`, `update_memory`, soft `forget` | contributor |
+| `forget(hard=True)`, `archive_project`, `grant_access`, `revoke_access` | owner |
+
+**3. Identity-bound audit.** Every memory carries `created_by`, populated from the verified token at write time — callers can't forge attribution. Every mutation (create / supersede / forget / update / purge) also writes a row to `memory_audit_log` inside the same transaction, recording the actor, reason, and before/after JSON state. The log is the action stream of record and survives even hard-deletes.
+
+The ACL and audit-log shipped in migrations 004 ([`migrations/004_project_acl.sql`](migrations/004_project_acl.sql)) and 005 ([`migrations/005_memory_audit_log.sql`](migrations/005_memory_audit_log.sql)). See [`AGENT.md`](AGENT.md) for the agent-facing access model and [`app/README.md`](app/README.md) for the per-tool role gates.
+
 ---
 
 ## Running it
@@ -95,6 +113,8 @@ Both behaviors land in migration 003 ([`migrations/003_supersede_lineage.sql`](m
    - `001_schema_hardening.sql` — required for deduplication
    - `002_projects.sql` — required for multi-project support
    - `003_supersede_lineage.sql` — required for supersede/forget
+   - `004_project_acl.sql` — required for per-project access control; drops the legacy `scope` column and renames `user_id` → `created_by`
+   - `005_memory_audit_log.sql` — required for the action-stream audit log
 4. Drop source documents in your workspace and run [`02_bootstrap.py`](02_bootstrap.py) to seed episodic memory.
 5. Run [`03_retrieval.py`](03_retrieval.py) and [`04_agent.py`](04_agent.py) to exercise read and write paths.
 

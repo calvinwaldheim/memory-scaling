@@ -1,6 +1,6 @@
 # memory-scaling MCP app
 
-A Databricks App that exposes the entire `memory_agent` package over MCP. Connect any MCP-aware client (Claude Desktop, Claude Code, Cursor, custom agents) and you get a project-scoped memory store with read, write, correct, retract, and audit capabilities.
+A Databricks App that exposes the entire `memory_agent` package over MCP. Connect any MCP-aware client (Claude Desktop, Claude Code, Cursor, custom agents) and you get a project-scoped memory store with read, write, correct, retract, audit, and access-control capabilities.
 
 The operating manual for the agent *using* this server is [`../AGENT.md`](../AGENT.md). This file covers the **server** — its tool surface, configuration, and how to deploy it.
 
@@ -8,14 +8,16 @@ The operating manual for the agent *using* this server is [`../AGENT.md`](../AGE
 
 ## Tool surface
 
-Thirteen MCP tools, grouped by concern.
+Seventeen MCP tools, grouped by concern. Every tool runs an ACL check at the top of the call; see [Access control](#access-control) below for the role each tool requires.
 
 ### Reading
 
 - **`recall(query, top_k=3, project_id=None, project_ids=None, memory_type=None, domain=None, min_quality_score=None, include_inactive=False)`**
-  Embed the query and return the top-k most-similar memories. Each result carries `id`, `content`, `source_ref`, `memory_type`, `domain`, `rule`, `quality_score`, `distance`, `project_id`, `superseded_at`, `superseded_by`, `forgotten_at`. Default excludes superseded and forgotten rows — flip `include_inactive=True` for audit.
+  Embed the query and return the top-k most-similar memories. Each result carries `id`, `content`, `source_ref`, `memory_type`, `domain`, `rule`, `quality_score`, `distance`, `project_id`, `superseded_at`, `superseded_by`, `forgotten_at`, `created_by`. Default excludes superseded and forgotten rows — flip `include_inactive=True` for audit. Multi-project queries are silently intersected with the caller's accessible projects.
 - **`get_lineage(memory_id)`**
   Walks the supersede chain forward (target → head) and backward (ancestors). Returns `target_id`, `head_id`, `chain[]`, `ancestors[]`.
+- **`get_audit_log(memory_id, limit=50)`**
+  Append-only action stream for one memory: every `created` / `superseded` / `forgotten` / `purged` / `updated` event with `actor`, `reason`, and `before_state` / `after_state` JSON snapshots. Survives even hard-deletes.
 - **`stats(project_id=None)`**
   Project health snapshot: `total`, `active_count`, `superseded_count`, `forgotten_count`, by-type/by-domain breakdowns, retrieval percentiles, `avg_quality_score`.
 - **`list_hot(top_k=10, project_id=None)`**
@@ -23,35 +25,71 @@ Thirteen MCP tools, grouped by concern.
 
 ### Writing
 
-- **`remember(content, source_ref, memory_type="episodic", scope="organizational", domain=None, rule=None, project_id=None, quality_score=0.5)`**
-  Write a new memory. Dedupes on `(project_id, content_hash)` — duplicate calls return `{"status": "duplicate"}`.
-- **`supersede(old_id, new_content, reason, user_id=None, rule=None, quality_score=None, source_ref=None, memory_type=None, scope=None, domain=None)`**
-  Atomically replace a wrong memory. Inherits `project_id`, `project_type`, `user_id`, `memory_type`, `scope`, `domain` from the old row by default. Five outcomes: `superseded`, `already_superseded` (with `current_head_id`), `forgotten`, `duplicate_content`, `not_found`.
-- **`forget(memory_id, reason=None, user_id=None, hard=False)`**
-  Soft-retract by default (sets `forgotten_at`, keeps the row). `hard=True` permanently deletes — only for GDPR or secret erasure.
-- **`update_memory(memory_id, rule=None, domain=None, quality_score=None, memory_type=None, scope=None)`**
+- **`remember(content, source_ref, memory_type="episodic", domain=None, rule=None, project_id=None, quality_score=0.5)`**
+  Write a new memory. Dedupes on `(project_id, content_hash)` — duplicate calls return `{"status": "duplicate"}`. The `created_by` field is populated from the verified token — there's no caller param for it.
+- **`supersede(old_id, new_content, reason, rule=None, quality_score=None, source_ref=None, memory_type=None, domain=None)`**
+  Atomically replace a wrong memory. Inherits `project_id`, `project_type`, `memory_type`, `domain` from the old row by default. The actor on both the old (`superseded_by_user`) and new row (`created_by`) is the verified token user. Five outcomes: `superseded`, `already_superseded` (with `current_head_id`), `forgotten`, `duplicate_content`, `not_found`.
+- **`forget(memory_id, reason=None, hard=False)`**
+  Soft-retract by default (sets `forgotten_at`, keeps the row, requires `contributor`). `hard=True` permanently deletes and requires `owner` — only for GDPR or secret erasure.
+- **`update_memory(memory_id, rule=None, domain=None, quality_score=None, memory_type=None)`**
   Edit metadata only. Cannot touch `content` — that's what `supersede` is for.
 
 ### Projects
 
 - **`create_project(project_id, name, project_type, description=None, tags=None)`**
-  Register a new project. `project_type` ∈ `data_domain`, `engineering`, `compliance`, `customer`, `product`. `project_id` is a slug.
+  Register a new project. The creator becomes `owner` automatically. `project_type` ∈ `data_domain`, `engineering`, `compliance`, `customer`, `product`. `project_id` is a slug.
 - **`list_projects(include_archived=False)`**
-  Returns all projects with `memory_count` populated.
+  Returns projects the caller has at least `viewer` access to, with `memory_count` populated. Projects you can't see are silently omitted.
 - **`archive_project(project_id)`**
-  Soft-delete (sets `archived_at`). Memories remain queryable by explicit `project_id`.
+  Soft-delete (sets `archived_at`). Requires `owner`. Memories remain queryable by explicit `project_id`.
 - **`set_active_project(project_id)`**
-  Make this project the default for all subsequent tool calls in this MCP subprocess. Lives in memory only — restarts wipe it.
+  Make this project the default for this user's subsequent tool calls. Per-user state — concurrent users on the same MCP subprocess don't collide. Lives in memory only — restarts wipe it.
 - **`get_active_project()`**
-  Reports `active_project_id`, `default_project_id`, `effective_project_id`.
+  Reports the calling user's `active_project_id`, `default_project_id`, `effective_project_id`.
+
+### Access control
+
+- **`grant_access(project_id, user_name, role)`**
+  Share a project at a specific role. Requires `owner`. Re-granting upserts.
+- **`revoke_access(project_id, user_name)`**
+  Remove a user's access. Requires `owner`.
+- **`list_access(project_id)`**
+  List every `(user, role)` pair on a project. Requires `viewer`.
 
 ### Project precedence
 
 For every tool that takes `project_id`, the effective project is resolved in this order:
 1. The `project_ids` list arg (if the tool accepts one).
 2. The explicit `project_id` arg.
-3. The active project from `set_active_project(...)`.
+3. The caller's active project from `set_active_project(...)` (per-user — concurrent users have independent active projects).
 4. The `DEFAULT_PROJECT_ID` env var (defaults to `memory-kb-poc`).
+
+ACL is enforced *after* resolution. A resolved project the caller has no role on returns `[]` from reads and raises `PermissionError` from writes.
+
+---
+
+## Access control
+
+Three roles per project, stored in `project_acl` (migration 004):
+
+- **`viewer`** — read-only.
+- **`contributor`** — viewer + can write/correct/soft-retract memories.
+- **`owner`** — contributor + admin (hard-delete, archive, grant/revoke).
+
+Per-tool gates:
+
+| Tool | Role |
+|---|---|
+| `recall`, `stats`, `list_hot`, `get_lineage`, `get_audit_log`, `list_access` | viewer |
+| `set_active_project` | viewer (on the target) |
+| `remember`, `supersede`, `update_memory`, `forget` (soft) | contributor |
+| `forget(hard=True)`, `archive_project`, `grant_access`, `revoke_access` | owner |
+| `create_project` | any authenticated user — creator auto-gets `owner` |
+| `list_projects`, `get_active_project` | any authenticated user (results filtered to accessible projects) |
+
+The verified Databricks user from the token verifier is the source of truth for identity. Caller-supplied `user_id` parameters are **not accepted** — every write tool injects the verified identity into the storage layer, where it lands on `memories.created_by` and on every `memory_audit_log.actor`. This is what makes the audit trail trustworthy: a malicious caller can't forge attribution.
+
+Migrations 004 and 005 must be applied for the server to function. The migration grants the user that runs it `owner` on every existing project; that user is responsible for granting others via `grant_access`.
 
 ---
 

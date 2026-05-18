@@ -81,12 +81,12 @@ def answer(
         project_id=project_id,
         project_type="product",
         memory_type="episodic",
-        scope="organizational",
         domain="interactions",
         rule=question[:100],
         context=content,
         source_ref=AGENT_SOURCE_REF,
         embedding=embed_text(content),
         quality_score=0.9,
+        created_by="agent",
     )
     return response
