@@ -621,6 +621,102 @@ def get_active_project() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Directory lookup — discover users before granting access
+# ---------------------------------------------------------------------------
+
+
+def _scim_bearer_token() -> str:
+    """Pick the bearer token for SCIM directory calls.
+
+    Preference order:
+      1. The caller's own verified token (HTTP transport — best, follows least
+         privilege, the SCIM query runs as the caller).
+      2. ``DATABRICKS_TOKEN`` env var (stdio transport — there's no caller
+         token; we use the runner's PAT, same identity Lakebase already uses).
+
+    Raises ``RuntimeError`` if neither is available so the failure is loud
+    instead of returning an empty result that looks like "no users matched".
+    """
+    tok = get_access_token()
+    if tok is not None:
+        return tok.token
+    env_token = os.environ.get("DATABRICKS_TOKEN")
+    if env_token:
+        return env_token
+    raise RuntimeError(
+        "find_user has no Databricks token to call SCIM with: "
+        "no verified caller token and DATABRICKS_TOKEN env var is unset."
+    )
+
+
+def _scim_search_users(query: str, limit: int) -> list[dict[str, Any]]:
+    """Call SCIM /Users with a filter and return raw resource dicts.
+
+    Factored out so tests can monkeypatch the network boundary the same way
+    they monkeypatch ``storage.*`` functions elsewhere in this module.
+    """
+    # Escape SCIM filter literal characters. SCIM filter strings are quoted
+    # with double quotes; backslash escapes within them.
+    safe = query.replace("\\", "\\\\").replace('"', '\\"')
+    scim_filter = (
+        f'(userName co "{safe}" or displayName co "{safe}") and active eq true'
+    )
+    bearer = _scim_bearer_token()
+    with httpx.Client(timeout=10) as client:
+        r = client.get(
+            f"{WORKSPACE_URL}/api/2.0/preview/scim/v2/Users",
+            headers={"Authorization": f"Bearer {bearer}"},
+            params={"filter": scim_filter, "count": limit},
+        )
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"SCIM /Users returned {r.status_code}: {r.text[:200]}"
+        )
+    body = r.json()
+    return body.get("Resources", []) or []
+
+
+@mcp.tool()
+def find_user(query: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Search the Databricks workspace directory for users.
+
+    Use this BEFORE calling ``grant_access`` or ``revoke_access`` to confirm
+    the target user exists in the workspace. The ``user_name`` field on each
+    result is the canonical identifier — pass it directly to ``grant_access``.
+
+    Matching is a case-insensitive substring (``co``) against both
+    ``userName`` (typically an email) and ``displayName`` (human name).
+    A query of ``"alice"`` will match ``alice@company.com`` and any
+    ``displayName`` containing ``"alice"``.
+
+    Only active users are returned. Inactive users can't authenticate, so
+    granting them would be a silent no-op.
+
+    Returns an empty list if no users match — try a shorter or different
+    query (e.g. just first name, or a different spelling).
+
+    ``limit`` is clamped to [1, 50] to keep result sets reviewable.
+    """
+    if not query or not query.strip():
+        return []
+    capped = max(1, min(limit, 50))
+    resources = _scim_search_users(query.strip(), capped)
+    out: list[dict[str, Any]] = []
+    for u in resources:
+        user_name = u.get("userName")
+        if not user_name:
+            continue
+        out.append(
+            {
+                "user_name": user_name,
+                "display_name": u.get("displayName") or user_name,
+                "active": bool(u.get("active", True)),
+            }
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Access control (ACL)
 # ---------------------------------------------------------------------------
 
